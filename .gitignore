@@ -216,3 +216,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project-specific
+weights/
+data/
+*.npz
+*.pt
+runs/
+pfc_dataset/
