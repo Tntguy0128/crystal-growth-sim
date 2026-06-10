@@ -36,8 +36,10 @@ import numpy as np
 
 # Allow running from repo root or from dataset/ folder
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
-from solvers.kobayashi import run_kobayashi
-
+try:
+    from solvers.kobayashi import run_kobayashi
+except ImportError:
+    from kobayashi import run_kobayashi
 # ── Parameter grid ────────────────────────────────────────────────────────────
 #
 # We sweep the four most visually important parameters.
