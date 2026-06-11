@@ -1,0 +1,14 @@
+# FNO surrogate pipeline dependencies
+# Install into a virtual environment, e.g.:
+#   python3 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# On Apple Silicon, the default torch wheel includes the MPS (GPU) backend.
+# For an NVIDIA GPU, install the CUDA build of torch from pytorch.org instead.
+
+torch>=2.0
+numpy>=1.23
+scipy>=1.9
+pyyaml>=6.0
+matplotlib>=3.6
+tensorboard>=2.11

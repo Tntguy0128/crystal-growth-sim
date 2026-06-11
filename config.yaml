@@ -1,0 +1,65 @@
+# ============================================================
+#  FNO training configuration
+#  Surrogate for the Phase Field Crystal (PFC) solver
+# ============================================================
+# Every knob the pipeline reads lives here. train_fno.py and
+# evaluate_fno.py both load this file, so a run is fully described
+# by (this config + the saved checkpoint).
+
+# ----- Data -------------------------------------------------
+data:
+  data_dir: data            # folder of .npz trajectories (+ optional manifest.csv)
+                            # (use data_pfc_large for the expanded generated set)
+  val_frac: 0.15            # fraction of TRAJECTORIES held out for validation
+  test_frac: 0.15           # fraction of TRAJECTORIES held out for testing
+  split_seed: 0             # RNG seed for the shuffle/split
+  split_by: trajectory      # 'trajectory' | 'config'. Use 'config' for ensemble
+                            # datasets (--ensemble N): keeps all noise
+                            # realizations of one (r, n0, seed_type) in the
+                            # same split, preventing near-duplicate leakage.
+  normalize: true           # z-score the density field using train-set stats
+  # --- conditioning (optional; keep false for the clean MSE baseline) ---
+  include_conditioning: false   # append r, n0 as extra input channels
+  normalize_conditioning: true  # z-score those conditioning channels
+
+# ----- Model ------------------------------------------------
+model:
+  modes: 16                 # Fourier modes kept per spatial axis
+  width: 32                 # hidden channel width
+  layers: 4                 # number of Fourier layers
+  in_channels: 1            # density only; AUTO-bumped to 3 if conditioning on
+  out_channels: 1           # predicted next density field
+  use_grid: true            # append normalized (x, y) coordinate channels
+
+# ----- Training ---------------------------------------------
+train:
+  epochs: 100
+  batch_size: 16
+  lr: 0.001
+  weight_decay: 0.00001
+  scheduler: cosine         # 'cosine' | 'step' | 'none'
+  step_size: 30             # (only used if scheduler == 'step')
+  gamma: 0.5                # (only used if scheduler == 'step')
+  grad_clip: 1.0            # max grad norm (0 disables)
+  num_workers: 0            # DataLoader workers (0 is safest on macOS/MPS)
+  device: auto              # 'auto' | 'cuda' | 'mps' | 'cpu'
+  seed: 0
+  # --- early stopping ---
+  early_stopping: true
+  patience: 15              # stop after this many epochs without val improvement
+  min_delta: 0.000001       # minimum val-loss improvement that counts
+
+# ----- Logging / checkpoints --------------------------------
+logging:
+  out_dir: runs/fno_baseline
+  ckpt_name: best.pt        # best-val checkpoint filename (under out_dir)
+  last_name: last.pt        # most-recent checkpoint filename
+  tensorboard: true         # write TensorBoard logs if the package is available
+  log_every: 20             # print/log every N training batches
+
+# ----- Evaluation -------------------------------------------
+eval:
+  rollout_length: 0         # 0 = roll out the full trajectory length
+  num_vis_trajectories: 3   # how many test rollouts to visualize
+  vis_frames: 6             # frames per rollout figure
+  out_dir: runs/fno_baseline/eval
