@@ -1,0 +1,63 @@
+# ============================================================
+#  Expanded PFC dataset: 6 r x 3 n0 x 3 seeds x 2 ensembles = 108 runs
+#  Use:  python generate_dataset.py --sweep --config pfc_config_large.yaml
+#  (one command — ensembles are handled natively; rerun with
+#   skip_existing: true to resume an interrupted sweep)
+# ============================================================
+
+run:
+  # physics
+  r: -0.28
+  n0: -0.285
+  M: 1.0
+
+  # grid
+  N: 128
+  L: 50.26548245743669      # 16 * pi
+
+  # time
+  dt: 0.25
+  T: 250.0
+  save_every: 25            # -> 40 frames per trajectory, dt_frame = 6.25
+
+  # initial condition
+  seed_type: hex
+  rng_seed: 42
+  noise_amplitude: 0.01
+  seed_amplitude: 0.20
+  n_seeds: 5
+  seed_k0: 1.0              # plant seeds at the equilibrium wavenumber so the
+                            # crystal grows FROM the seed (deterministic,
+                            # seed-driven dynamics — easier for the FNO than
+                            # the baseline's noise-nucleated k0=4 regime)
+
+  # output
+  output_dir: data_pfc_large
+  save_plots: false
+  save_animation: false
+
+  # sanity checks
+  mass_drift_tol: 1.0e-5
+  energy_increase_tol: 1.0e-3
+
+# ----- Expanded sweep -----
+sweep:
+  # Denser temperature sampling (6 values spanning a wider quench range)
+  r_values: [-0.20, -0.25, -0.28, -0.30, -0.33, -0.40]
+  n0_values: [-0.27, -0.285, -0.30]
+  seed_types: [hex, point, multi]
+
+  # 2 noise realizations of every configuration (108 runs total).
+  # Run ids 0000-0053 are ensemble 0, 0054-0107 are ensemble 1; every run
+  # gets a unique deterministic rng_seed = base_rng_seed + run_index.
+  n_ensemble: 2
+
+  base_rng_seed: 1000
+  skip_existing: false      # set true to resume an interrupted sweep
+  parallel: true
+  max_workers: 6
+
+# NOTE for FNO training on this dataset (config.yaml):
+#   data:
+#     data_dir: data_pfc_large
+#     split_by: config      # keep ensemble members of one config in one split
