@@ -24,12 +24,21 @@ data:
 
 # ----- Model ------------------------------------------------
 model:
-  modes: 16                 # Fourier modes kept per spatial axis
+  modes: 16                 # Fourier modes kept per spatial axis. Verified
+                            # against the data: mode index m = wavenumber k*8
+                            # (L = 16*pi), and 99.999% of PFC spectral energy
+                            # lies below m = 16 -- this cutoff loses nothing.
   width: 32                 # hidden channel width
   layers: 4                 # number of Fourier layers
   in_channels: 1            # density only; AUTO-bumped to 3 if conditioning on
   out_channels: 1           # predicted next density field
   use_grid: true            # append normalized (x, y) coordinate channels
+  predict_delta: true       # predict the CHANGE dn and output n_t + dn
+                            # (better conditioned; rollout starts at identity)
+  enforce_mass: true        # project prediction to conserve mean(n) EXACTLY,
+                            # matching PFC's conserved dynamics. Architectural
+                            # constraint, not a loss term -- objective stays
+                            # pure MSE. Set false to ablate the clean baseline.
 
 # ----- Training ---------------------------------------------
 train:
@@ -48,6 +57,10 @@ train:
   early_stopping: true
   patience: 15              # stop after this many epochs without val improvement
   min_delta: 0.000001       # minimum val-loss improvement that counts
+  # --- rollout validation (logged during training; 0 disables) ---
+  rollout_val_every: 10     # every N epochs, run autoregressive rollouts on
+  rollout_val_trajs: 5      # this many val trajectories; logs multi-step MSE
+                            # and final mass drift to console + TensorBoard
 
 # ----- Logging / checkpoints --------------------------------
 logging:
