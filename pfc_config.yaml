@@ -1,0 +1,54 @@
+# ============================================================
+#  PFC solver / dataset-generation configuration
+#  (separate from config.yaml, which configures FNO TRAINING)
+# ============================================================
+# Used by:  python generate_dataset.py --single|--sweep --config pfc_config.yaml
+# CLI flags override this file; this file overrides the dataclass defaults
+# in pfc_solver.py (which reproduce PCF_Baseline.py exactly).
+
+# ----- Single-run parameters (also the base for every sweep run) -----
+run:
+  # physics
+  r: -0.28                  # temperature parameter (more negative = deeper quench)
+  n0: -0.285                # mean density (hexagonal-phase region)
+  M: 1.0                    # mobility
+
+  # grid
+  N: 128                    # grid points per side
+  L: 50.26548245743669      # domain size = 16 * pi (matches the baseline)
+
+  # time
+  dt: 0.25                  # solver timestep (semi-implicit allows this)
+  T: 250.0                  # total simulated time
+  save_every: 25            # save a frame every 25 steps -> 40 frames, dt_frame = 6.25
+
+  # initial condition
+  seed_type: hex            # hex | point | multi | random_noise | custom_mask
+  rng_seed: 42
+  noise_amplitude: 0.01     # std of initial liquid noise
+  seed_amplitude: 0.20      # amplitude of the planted crystal pattern
+  n_seeds: 5                # number of seeds when seed_type = multi
+  # custom_mask: path/to/mask.npy   # required when seed_type = custom_mask
+  # seed_k0: 1.0            # planted-pattern wavenumber; unset = baseline 2*pi/(4*dx)
+                            # (= 4.0, which decays -- the PFC equilibrium is k ~ 1)
+
+  # output
+  output_dir: data_pfc      # .npz trajectories + manifest.csv land here
+  save_plots: false         # growth-sequence + free-energy PNGs per run
+  save_animation: false     # GIF per run (slow; keep off for sweeps)
+
+  # sanity-check tolerances
+  mass_drift_tol: 1.0e-5    # relative drift of mean(n) (float32 storage floor ~1e-7)
+  energy_increase_tol: 1.0e-3   # allowed relative free-energy uptick per frame
+
+# ----- Parameter sweep (4 x 3 x 3 = 36 runs) -----
+sweep:
+  r_values: [-0.25, -0.28, -0.30, -0.33]
+  n0_values: [-0.27, -0.285, -0.30]
+  seed_types: [hex, point, multi]
+  base_rng_seed: 1000       # run i gets rng_seed = base_rng_seed + i (deterministic)
+  n_ensemble: 1             # repeat the whole grid this many times with fresh
+                            # noise (unique run ids/seeds across members)
+  skip_existing: false      # true = resume: skip runs whose .npz already exists
+  parallel: false           # ProcessPoolExecutor across runs
+  max_workers: 4
