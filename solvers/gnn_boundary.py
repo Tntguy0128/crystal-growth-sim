@@ -184,8 +184,8 @@ def compute_node_features(xy: np.ndarray,
     ddx = np.gradient(dx)
     ddy = np.gradient(dy)
     denom = (dx**2 + dy**2) ** 1.5 + 1e-10
-    feat[:, 5] = np.abs(dx * ddy - dy * ddx) / denom
-
+    curv = np.abs(dx * ddy - dy * ddx) / denom
+    feat[:, 5] = np.log1p(curv)   # log(1 + curv) compresses the range
     # 6-7: phase gradient at each boundary point
     # sample the gradient field at the boundary pixel locations
     grad_y, grad_x = np.gradient(phase_field)
