@@ -126,16 +126,20 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None,
     """
     One pass over `loader`. With `optimizer` we train; without it we
     evaluate under no_grad. Returns the mean MSE over all pairs.
+
+    Prints live in-epoch progress (batch counter + throughput) so a slow
+    device or stalled run is visible immediately instead of looking hung.
     """
     is_train = optimizer is not None
     model.train(is_train)
 
     total, n = 0.0, 0
+    t0 = time.perf_counter()
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
     with grad_ctx:
         for it, (x, y) in enumerate(loader):
-            x = x.to(device)          # (B, C, H, W)  frame_t (+ conditioning)
-            y = y.to(device)          # (B, 1, H, W)  frame_t+1
+            x = x.to(device, non_blocking=True)   # (B, C, H, W)  frame_t
+            y = y.to(device, non_blocking=True)   # (B, 1, H, W)  frame_t+1
 
             pred = model(x)           # (B, 1, H, W)
             loss = loss_fn(pred, y)
@@ -151,9 +155,17 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None,
             total += loss.item() * bs
             n += bs
 
-            if is_train and writer is not None and (it % log_every == 0):
-                writer.add_scalar("batch/train_mse", loss.item(),
-                                  epoch * len(loader) + it)
+            if is_train and (it + 1) % log_every == 0:
+                rate = (it + 1) / (time.perf_counter() - t0)
+                eta = (len(loader) - it - 1) / max(rate, 1e-9)
+                print(f"\r    batch {it + 1:4d}/{len(loader)}  "
+                      f"mse {loss.item():.3e}  "
+                      f"{rate:4.1f} batch/s  eta {eta:4.0f}s ", end="", flush=True)
+                if writer is not None:
+                    writer.add_scalar("batch/train_mse", loss.item(),
+                                      epoch * len(loader) + it)
+    if is_train:
+        print("\r" + " " * 70 + "\r", end="", flush=True)   # clear progress line
     return total / max(n, 1)
 
 
@@ -184,39 +196,46 @@ def rollout_validation(model, files, info, manifest, device, max_traj=5):
     Free-running rollout from frame_0 on up to `max_traj` validation
     trajectories:  n0 -> n1_hat -> n2_hat -> ...  (model eats its own output).
 
+    All trajectories are rolled out together as one batch -- T-1 forward
+    passes total instead of (T-1) * n_traj, so this stays cheap even when
+    called every few epochs.
+
     Returns (mean rollout MSE over all steps/trajectories in PHYSICAL units,
              mean relative mass drift at the final step).
     """
     model.eval()
     mean, std = info["norm_mean"], info["norm_std"]
-    mses, drifts = [], []
 
+    # Stack the ground-truth trajectories: (B, T, H, W) in physical units.
+    trajs, conds = [], []
     for path in files[:max_traj]:
         rec = inspect_trajectory(path)
-        true_phys = np.concatenate(
-            [rec["inputs"], rec["targets"][-1:]], axis=0)       # (T, H, W)
-        T, H, W = true_phys.shape
+        trajs.append(np.concatenate([rec["inputs"], rec["targets"][-1:]], axis=0))
+        conds.append(_conditioning_for(path, manifest, info["cond_stats"])
+                     if info["include_conditioning"] else None)
+    T = min(t.shape[0] for t in trajs)                  # common horizon
+    true_phys = np.stack([t[:T] for t in trajs])        # (B, T, H, W)
+    B, _, H, W = true_phys.shape
 
-        cond = (_conditioning_for(path, manifest, info["cond_stats"])
-                if info["include_conditioning"] else None)
+    cond_maps = None
+    if info["include_conditioning"]:
+        c = torch.from_numpy(np.stack(conds)).float()                  # (B, n_cond)
+        cond_maps = c.view(B, -1, 1, 1).expand(B, c.shape[1], H, W).to(device)
 
-        cur = (true_phys[0] - mean) / (std + 1e-8)              # normalized
-        preds = [true_phys[0]]
-        for _ in range(T - 1):
-            x = torch.from_numpy(np.ascontiguousarray(cur)).view(1, 1, H, W)
-            if cond is not None:
-                chans = [x] + [torch.full((1, 1, H, W), float(c)) for c in cond]
-                x = torch.cat(chans, dim=1)
-            nxt = model(x.to(device)).cpu().numpy()[0, 0]
-            preds.append(nxt * (std + 1e-8) + mean)             # physical units
-            cur = nxt
-        preds = np.stack(preds)
+    cur = torch.from_numpy(
+        (true_phys[:, 0] - mean) / (std + 1e-8)).float().view(B, 1, H, W).to(device)
+    preds = [true_phys[:, 0]]
+    for _ in range(T - 1):
+        x = cur if cond_maps is None else torch.cat([cur, cond_maps], dim=1)
+        cur = model(x)
+        preds.append(cur.cpu().numpy()[:, 0] * (std + 1e-8) + mean)   # physical
+    preds = np.stack(preds, axis=1)                     # (B, T, H, W)
 
-        mses.append(float(np.mean((preds[1:] - true_phys[1:]) ** 2)))
-        m_true = true_phys[-1].mean()
-        drifts.append(float(abs(preds[-1].mean() - m_true) / (abs(m_true) + 1e-12)))
-
-    return float(np.mean(mses)), float(np.mean(drifts))
+    mse = float(np.mean((preds[:, 1:] - true_phys[:, 1:]) ** 2))
+    m_true = true_phys[:, -1].mean(axis=(1, 2))
+    m_pred = preds[:, -1].mean(axis=(1, 2))
+    drift = float(np.mean(np.abs(m_pred - m_true) / (np.abs(m_true) + 1e-12)))
+    return mse, drift
 
 
 # ----------------------------------------------------------------------------
@@ -231,6 +250,12 @@ def main():
     set_seed(cfg["train"].get("seed", 0))
     device = pick_device(cfg["train"].get("device", "auto"))
     print(f"Device: {device}")
+    if device.type == "cpu":
+        print("\n" + "!" * 64)
+        print("! WARNING: no GPU detected -- training on CPU is 10-30x slower.")
+        print("! In Colab: Runtime -> Change runtime type -> T4 GPU, then")
+        print("! restart and rerun the notebook from the top.")
+        print("!" * 64 + "\n")
 
     # --- data ---
     train_ds, val_ds, test_ds, info = build_datasets(cfg)
@@ -245,10 +270,12 @@ def main():
           f"(in_channels={info['in_channels']})")
 
     nw = cfg["train"].get("num_workers", 0)
+    pin = device.type == "cuda"          # faster host->GPU copies on CUDA
     train_loader = DataLoader(train_ds, batch_size=cfg["train"]["batch_size"],
-                              shuffle=True, num_workers=nw, drop_last=False)
+                              shuffle=True, num_workers=nw, drop_last=False,
+                              pin_memory=pin)
     val_loader = DataLoader(val_ds, batch_size=cfg["train"]["batch_size"],
-                            shuffle=False, num_workers=nw)
+                            shuffle=False, num_workers=nw, pin_memory=pin)
 
     # --- model ---
     cfg["model"]["in_channels"] = info["in_channels"]

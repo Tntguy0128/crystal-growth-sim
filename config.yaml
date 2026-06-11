@@ -43,7 +43,8 @@ model:
 # ----- Training ---------------------------------------------
 train:
   epochs: 100
-  batch_size: 16
+  batch_size: 32            # fits easily on a T4 / Apple GPU at 128x128;
+                            # fewer, larger batches = less per-step overhead
   lr: 0.001
   weight_decay: 0.00001
   scheduler: cosine         # 'cosine' | 'step' | 'none'
