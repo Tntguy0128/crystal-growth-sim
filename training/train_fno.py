@@ -163,8 +163,16 @@ def main():
         weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
     scheduler = make_scheduler(optimizer, cfg, len(train_loader))
-    loss_fn = nn.MSELoss()           # <-- pure MSE, the clean baseline
+class WeightedMSE(nn.Module):
+    def __init__(self, crystal_weight=50.0):
+        super().__init__()
+        self.w = crystal_weight
 
+    def forward(self, pred, target):
+        weights = 1.0 + (self.w - 1.0) * (target > 0.1).float()
+        return (weights * (pred - target)**2).mean()
+
+loss_fn = WeightedMSE(crystal_weight=50.0)
     # --- logging / checkpoint dirs ---
     out_dir = cfg["logging"]["out_dir"]
     os.makedirs(out_dir, exist_ok=True)
