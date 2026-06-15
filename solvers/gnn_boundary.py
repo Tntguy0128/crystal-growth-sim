@@ -214,24 +214,29 @@ def _resample_contour(xy: np.ndarray, n: int) -> np.ndarray:
 
 # ── Node feature computation ──────────────────────────────────────────────────
 
-def compute_node_features(xy: np.ndarray,
-                           phase_field: np.ndarray,
-                           contour_id: np.ndarray) -> np.ndarray:
+def compute_positional_features(xy: np.ndarray,
+                                 contour_id: np.ndarray) -> np.ndarray:
     """
-    Per-node features for the GNN. 9 features total (was 8 in v1):
+    Compute the 7 position-derived features (everything except the
+    phase-gradient features 6-7), which depend ONLY on point positions
+    and contour assignment — NOT on a phase field.
+
+    This is used during autoregressive rollout, where after the first
+    step we no longer have a phase field for the predicted boundary
+    (we deliberately avoid the field-reconstruction roundtrip — see
+    rollout_trajectory in evaluate_gnn.py for why).
+
+    Returns
+    -------
+    feat : (N, 9) float32, with columns 6-7 (gradient) left as zero.
         0-1  : (x, y) position, normalised [0,1]
         2-3  : displacement from domain centre (dx, dy)
         4    : distance from domain centre
         5    : local curvature, log1p-compressed
-        6-7  : phase gradient (dphi/dx, dphi/dy), normalised
+        6-7  : zero placeholder (fill in separately, e.g. carry forward)
         8    : normalised contour id (which crystal cluster)
-
-    Curvature and gradients are computed PER CONTOUR so that
-    finite-difference stencils don't wrap across different
-    crystal clusters.
     """
     N_pts = xy.shape[0]
-    H, W  = phase_field.shape
     feat  = np.zeros((N_pts, 9), dtype=np.float32)
 
     feat[:, 0:2] = xy
@@ -239,9 +244,6 @@ def compute_node_features(xy: np.ndarray,
     feat[:, 2]   = xy[:, 0] - cx
     feat[:, 3]   = xy[:, 1] - cy
     feat[:, 4]   = np.sqrt(feat[:, 2]**2 + feat[:, 3]**2)
-
-    grad_y, grad_x = np.gradient(phase_field)
-    prange = phase_field.max() - phase_field.min() + 1e-8
 
     n_contours = int(contour_id.max()) + 1 if N_pts > 0 else 0
     for cid in range(n_contours):
@@ -258,18 +260,42 @@ def compute_node_features(xy: np.ndarray,
         curv  = np.abs(dx * ddy - dy * ddx) / denom
         feat[mask, 5] = np.log1p(curv)   # compress huge curvature range
 
-    # phase gradient sampled at each boundary pixel
+    if n_contours > 1:
+        feat[:, 8] = contour_id.astype(np.float32) / (n_contours - 1)
+    else:
+        feat[:, 8] = 0.0
+
+    return feat
+
+
+def compute_node_features(xy: np.ndarray,
+                           phase_field: np.ndarray,
+                           contour_id: np.ndarray) -> np.ndarray:
+    """
+    Per-node features for the GNN. 9 features total (was 8 in v1):
+        0-1  : (x, y) position, normalised [0,1]
+        2-3  : displacement from domain centre (dx, dy)
+        4    : distance from domain centre
+        5    : local curvature, log1p-compressed
+        6-7  : phase gradient (dphi/dx, dphi/dy), normalised
+        8    : normalised contour id (which crystal cluster)
+
+    Curvature and gradients are computed PER CONTOUR so that
+    finite-difference stencils don't wrap across different
+    crystal clusters.
+    """
+    feat = compute_positional_features(xy, contour_id)
+
+    H, W = phase_field.shape
+    grad_y, grad_x = np.gradient(phase_field)
+    prange = phase_field.max() - phase_field.min() + 1e-8
+
+    N_pts = xy.shape[0]
     for i in range(N_pts):
         px = int(np.clip(xy[i, 0] * W, 0, W - 1))
         py = int(np.clip(xy[i, 1] * H, 0, H - 1))
         feat[i, 6] = grad_x[py, px] / prange
         feat[i, 7] = grad_y[py, px] / prange
-
-    # normalised contour id (helps GNN distinguish clusters)
-    if n_contours > 1:
-        feat[:, 8] = contour_id.astype(np.float32) / (n_contours - 1)
-    else:
-        feat[:, 8] = 0.0
 
     return feat
 
