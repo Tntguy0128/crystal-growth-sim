@@ -38,6 +38,7 @@ try:
     from solvers.gnn_model import CrystalGNN, BoundaryLoss
     from solvers.gnn_boundary import (
         extract_boundary_points, compute_node_features,
+        compute_positional_features,
         build_graph, boundary_to_field, frames_to_graph,
         N_NODES, K_NEIGHBORS
     )
@@ -45,6 +46,7 @@ except ImportError:
     from gnn_model import CrystalGNN, BoundaryLoss
     from gnn_boundary import (
         extract_boundary_points, compute_node_features,
+        compute_positional_features,
         build_graph, boundary_to_field, frames_to_graph,
         N_NODES, K_NEIGHBORS
     )
@@ -96,11 +98,35 @@ def rollout_trajectory(model, frames: np.ndarray, device,
                         k: int = K_NEIGHBORS,
                         max_steps: int = None) -> dict:
     """
-    Autoregressive rollout: predict boundary at each step,
-    use prediction as input for next step.
+    Autoregressive rollout that stays in BOUNDARY-POINT SPACE between
+    steps — it does NOT roundtrip through a reconstructed phase field.
+
+    Why: boundary_to_field() uses cv2.fillPoly, which fills in concave
+    regions (e.g. the thin gaps between dendrite arms). Reconstructing
+    a field every step and re-extracting contours from it causes the
+    crystal to be progressively "rounded off" into a smooth blob —
+    this happens even with a PERFECT (ground-truth) displacement, so
+    it is a reconstruction-pipeline artifact, not a model error.
+
+    Instead:
+      - Step 0: extract (xy, contour_id) and full 9D features from the
+        TRUE initial frame (so the gradient feature is real).
+      - Each step: build graph from current (xy, feat, contour_id),
+        predict displacement, move points -> new_xy. Recompute the
+        7 position-derived features (0-5, 8) directly from new_xy
+        (no field needed). Carry forward the gradient feature (6-7)
+        from the previous step (same point index = same physical
+        point, just moved slightly — gradient direction changes
+        slowly between steps).
+      - contour_id and point-count-per-contour are FIXED for the whole
+        rollout (only positions move), which also prevents the
+        "merged blob" failure mode by construction.
+      - A field is reconstructed via boundary_to_field ONLY for
+        visualisation / field-MSE reporting — that reconstruction
+        never feeds back into the next step.
 
     Returns dict with:
-        pred_fields  : list of (N,N) predicted phase fields
+        pred_fields  : list of (N,N) predicted phase fields (for display)
         true_fields  : list of (N,N) ground truth fields
         boundary_mse : per-step MSE on boundary positions
         field_mse    : per-step MSE on reconstructed fields
@@ -109,37 +135,34 @@ def rollout_trajectory(model, frames: np.ndarray, device,
     if max_steps is not None:
         T = min(T, max_steps + 1)
 
+    N_grid = frames[0].shape[0]
+
     pred_fields  = [frames[0].copy()]
     true_fields  = [frames[0].copy()]
     boundary_mse = []
     field_mse    = []
 
-    # Start from true initial frame
-    current_field = frames[0].copy()
+    # Initialise from the TRUE initial frame (real gradient features)
+    result = extract_boundary_points(frames[0], n_points=n_nodes)
+    if result is None:
+        # No boundary in the first frame at all — nothing to roll out
+        return {
+            'pred_fields' : pred_fields,
+            'true_fields' : true_fields,
+            'boundary_mse': np.array([]),
+            'field_mse'   : np.array([]),
+        }
+    xy, cid = result
+    feat = compute_node_features(xy, frames[0], cid)   # full 9D, real gradient
 
     for t in range(T - 1):
-        # Extract multi-contour boundary from current predicted field
-        result = extract_boundary_points(current_field, n_points=n_nodes)
-        if result is None:
-            # Crystal too small — copy ground truth to keep rollout alive
-            current_field = frames[t + 1].copy()
-            pred_fields.append(current_field.copy())
-            true_fields.append(frames[t + 1].copy())
-            boundary_mse.append(0.0)
-            field_mse.append(0.0)
-            continue
-        xy, cid = result
-
-        feat  = compute_node_features(xy, current_field, cid)
-        graph = build_graph(xy, feat, cid, k=k)
-        graph = graph.to(device)
+        graph = build_graph(xy, feat, cid, k=k).to(device)
 
         # Predict displacement
         pred_disp = model(graph).cpu().numpy()   # (N, 2)
 
-        # Move boundary
-        new_xy = xy + pred_disp
-        new_xy = np.clip(new_xy, 0.0, 1.0)
+        # Move boundary points directly — no field roundtrip
+        new_xy = np.clip(xy + pred_disp, 0.0, 1.0)
 
         # Get true next boundary for MSE — compare against a freshly
         # extracted true boundary with the same total node budget
@@ -152,16 +175,19 @@ def rollout_trajectory(model, frames: np.ndarray, device,
             b_mse = 0.0
         boundary_mse.append(b_mse)
 
-        # Reconstruct phase field from predicted boundary (per-contour fill)
-        N_grid        = frames[0].shape[0]
-        pred_field    = boundary_to_field(new_xy, cid, N=N_grid)
-        current_field = pred_field
-
+        # Reconstruct a field for DISPLAY/MSE only — does not feed back
+        pred_field = boundary_to_field(new_xy, cid, N=N_grid)
         pred_fields.append(pred_field.copy())
         true_fields.append(frames[t + 1].copy())
+        field_mse.append(np.mean((pred_field - frames[t + 1]) ** 2))
 
-        f_mse = np.mean((pred_field - frames[t + 1]) ** 2)
-        field_mse.append(f_mse)
+        # Build next step's features directly from new_xy (no field):
+        # recompute positional features (0-5, 8), carry forward the
+        # gradient feature (6-7) from the previous step.
+        new_feat = compute_positional_features(new_xy, cid)
+        new_feat[:, 6:8] = feat[:, 6:8]   # carry forward gradient
+
+        xy, feat = new_xy, new_feat
 
     return {
         'pred_fields' : pred_fields,
