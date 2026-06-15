@@ -97,7 +97,7 @@ def rollout_trajectory(model, frames: np.ndarray, device,
                         n_nodes: int = N_NODES,
                         k: int = K_NEIGHBORS,
                         max_steps: int = None,
-                        max_step_multiplier: float = 2.0) -> dict:
+                        max_step_multiplier: float = 1.0) -> dict:
     """
     Autoregressive rollout that stays in BOUNDARY-POINT SPACE between
     steps — it does NOT roundtrip through a reconstructed phase field.
@@ -213,12 +213,16 @@ def rollout_trajectory(model, frames: np.ndarray, device,
             # calibrating to contour size (tiny seeds get tiny max steps,
             # large contours get larger ones) — no magic global constant.
             #
-            # Without this, a single point with even a small per-step
-            # outward bias can run away into a spike over 40 autoregressive
-            # steps (linear accumulation with no negative feedback).
+            # IMPORTANT: use the MEDIAN edge length, not the mean. If a
+            # single point spikes outward, its own two edges become huge —
+            # the MEAN would be dragged up by exactly that outlier, raising
+            # next step's cap and letting it spike further (a feedback
+            # loop that defeats the clip entirely). The median is robust
+            # to that one outlier as long as most edges remain normal.
             pts = xy[mask]
             ring_next = np.roll(pts, -1, axis=0)
-            ring_edge_len = np.linalg.norm(pts - ring_next, axis=1).mean()
+            edge_lens = np.linalg.norm(pts - ring_next, axis=1)
+            ring_edge_len = np.median(edge_lens)
             max_step = max(ring_edge_len * max_step_multiplier, 1e-4)
 
             radial_clipped = np.minimum(radial_clipped, max_step)
