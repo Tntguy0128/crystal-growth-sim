@@ -180,6 +180,32 @@ def rollout_trajectory(model, frames: np.ndarray, device,
             pred_disp_centered[mask] -= pred_disp[mask].mean(axis=0, keepdims=True)
         pred_disp = pred_disp_centered
 
+        # Enforce "solid never becomes liquid": for each contour, decompose
+        # each point's displacement into a RADIAL component (relative to
+        # that contour's centroid) and a TANGENTIAL component. Clip the
+        # radial component to be >= 0 — points may move outward (growth)
+        # or sideways (arm curvature/competition), but never inward, which
+        # would mean previously-solidified material un-solidifying. The
+        # centroid itself doesn't move (pinned above), so each contour's
+        # minimum radius is monotonically non-decreasing across the whole
+        # rollout — the original seed footprint can never shrink or vanish.
+        for c in np.unique(cid):
+            mask = cid == c
+            centroid = xy[mask].mean(axis=0)
+            rel = xy[mask] - centroid                      # (n_c, 2)
+            r   = np.linalg.norm(rel, axis=1, keepdims=True)  # (n_c, 1)
+
+            r_hat = np.zeros_like(rel)
+            nonzero = r[:, 0] > 1e-8
+            r_hat[nonzero] = rel[nonzero] / r[nonzero]
+
+            disp_c = pred_disp[mask]
+            radial = np.sum(disp_c * r_hat, axis=1, keepdims=True)  # (n_c,1)
+            tangential = disp_c - radial * r_hat
+            radial_clipped = np.maximum(radial, 0.0)
+
+            pred_disp[mask] = radial_clipped * r_hat + tangential
+
         # Move boundary points directly — no field roundtrip
         new_xy = np.clip(xy + pred_disp, 0.0, 1.0)
 
