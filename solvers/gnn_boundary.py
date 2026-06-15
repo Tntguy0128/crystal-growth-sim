@@ -47,6 +47,9 @@ K_NEIGHBORS    = 8       # global KNN connectivity
 THRESHOLD      = 0.5     # phase field threshold for solid/liquid boundary
 MIN_CONTOUR_LEN = 8       # ignore contours shorter than this (noise)
 MIN_NODES_PER_CONTOUR = 16  # minimum points allocated to any contour
+MAX_CONTOURS   = 24       # keep at most this many largest contours
+                          # (avoids node budget being eaten by dozens of
+                          # tiny isolated nucleation specks)
 
 
 # ── Multi-contour boundary extraction ─────────────────────────────────────────
@@ -93,6 +96,18 @@ def extract_boundary_points(phase_field: np.ndarray,
     if len(contours) == 0:
         return None
 
+    # If there are more contours than MAX_CONTOURS, keep only the
+    # largest ones (by arc length) — tiny isolated nucleation specks
+    # contribute little visually and would otherwise eat the node
+    # budget at MIN_NODES_PER_CONTOUR each.
+    if len(contours) > MAX_CONTOURS:
+        lens = []
+        for c in contours:
+            diffs = np.diff(c, axis=0, prepend=c[-1:])
+            lens.append(np.sqrt((diffs ** 2).sum(axis=1)).sum())
+        keep_idx = np.argsort(lens)[-MAX_CONTOURS:]
+        contours = [contours[i] for i in sorted(keep_idx)]
+
     # Arc length of each contour
     lengths = []
     for c in contours:
@@ -102,29 +117,59 @@ def extract_boundary_points(phase_field: np.ndarray,
 
     n_contours = len(contours)
 
-    # Allocate at least MIN_NODES_PER_CONTOUR to each, distribute the
-    # remainder proportionally to arc length.
+    # If there are so many contours that even the minimum allocation
+    # exceeds the node budget, fall back to a pure proportional split
+    # (no per-contour minimum) — this avoids an infinite loop in the
+    # rounding-correction step below when n_contours is large (many
+    # tiny isolated nucleation spots).
     base = MIN_NODES_PER_CONTOUR
-    remaining = max(0, n_points - base * n_contours)
-    weights = lengths / lengths.sum()
-    extra = np.floor(weights * remaining).astype(int)
-
-    # Fix rounding so total == n_points exactly
-    counts = base + extra
-    diff = n_points - counts.sum()
-    if diff > 0:
-        # give leftover to the largest contour
-        counts[np.argmax(lengths)] += diff
-    elif diff < 0:
-        # trim from the largest contours first
-        order = np.argsort(-counts)
+    if base * n_contours > n_points:
+        weights = lengths / lengths.sum()
+        counts  = np.maximum(1, np.floor(weights * n_points).astype(int))
+        diff    = n_points - counts.sum()
+        order   = np.argsort(-lengths)
         i = 0
-        while diff < 0:
+        # distribute or remove leftover one at a time, largest first,
+        # never going below 1 point per contour
+        while diff != 0 and i < n_points * 4:
             c = order[i % n_contours]
-            if counts[c] > MIN_NODES_PER_CONTOUR:
+            if diff > 0:
+                counts[c] += 1
+                diff -= 1
+            elif counts[c] > 1:
                 counts[c] -= 1
                 diff += 1
             i += 1
+    else:
+        # Allocate at least MIN_NODES_PER_CONTOUR to each, distribute the
+        # remainder proportionally to arc length.
+        remaining = max(0, n_points - base * n_contours)
+        weights = lengths / lengths.sum()
+        extra = np.floor(weights * remaining).astype(int)
+
+        counts = base + extra
+        diff = n_points - counts.sum()
+        if diff > 0:
+            counts[np.argmax(lengths)] += diff
+        elif diff < 0:
+            order = np.argsort(-counts)
+            i = 0
+            while diff < 0 and i < n_points * 4:
+                c = order[i % n_contours]
+                if counts[c] > MIN_NODES_PER_CONTOUR:
+                    counts[c] -= 1
+                    diff += 1
+                i += 1
+            # Safety net: if we still couldn't trim enough (shouldn't
+            # happen given the branch above), clamp to n_points total.
+            if diff < 0:
+                excess = -diff
+                for c in order:
+                    take = min(excess, counts[c] - 1)
+                    counts[c] -= take
+                    excess -= take
+                    if excess <= 0:
+                        break
 
     all_xy  = []
     all_cid = []
