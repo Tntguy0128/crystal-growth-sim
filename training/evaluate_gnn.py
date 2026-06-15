@@ -161,6 +161,25 @@ def rollout_trajectory(model, frames: np.ndarray, device,
         # Predict displacement
         pred_disp = model(graph).cpu().numpy()   # (N, 2)
 
+        # Pin each contour's centroid in place: subtract that contour's
+        # MEAN predicted displacement from all of its points.
+        #
+        # Rationale: for true radial crystal growth, outward displacement
+        # vectors point in many different directions and their average is
+        # ~0 — the centroid doesn't move, only the shape expands. Any
+        # systematic non-zero mean in the model's predictions is therefore
+        # rollout error (translation drift), not real growth signal. Over
+        # 40 autoregressive steps even a tiny per-step drift compounds into
+        # the whole crystal visibly sliding across the canvas. Removing the
+        # per-contour mean keeps the RELATIVE shape-deformation signal
+        # (which arm grows faster than another) while eliminating the
+        # rigid-body drift.
+        pred_disp_centered = pred_disp.copy()
+        for c in np.unique(cid):
+            mask = cid == c
+            pred_disp_centered[mask] -= pred_disp[mask].mean(axis=0, keepdims=True)
+        pred_disp = pred_disp_centered
+
         # Move boundary points directly — no field roundtrip
         new_xy = np.clip(xy + pred_disp, 0.0, 1.0)
 
