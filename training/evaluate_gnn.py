@@ -96,7 +96,8 @@ def one_step_mse(model, test_graphs, device, batch_size=32):
 def rollout_trajectory(model, frames: np.ndarray, device,
                         n_nodes: int = N_NODES,
                         k: int = K_NEIGHBORS,
-                        max_steps: int = None) -> dict:
+                        max_steps: int = None,
+                        max_step_multiplier: float = 2.0) -> dict:
     """
     Autoregressive rollout that stays in BOUNDARY-POINT SPACE between
     steps — it does NOT roundtrip through a reconstructed phase field.
@@ -203,6 +204,27 @@ def rollout_trajectory(model, frames: np.ndarray, device,
             radial = np.sum(disp_c * r_hat, axis=1, keepdims=True)  # (n_c,1)
             tangential = disp_c - radial * r_hat
             radial_clipped = np.maximum(radial, 0.0)
+
+            # Bound the per-step move by local point spacing: a boundary
+            # point physically cannot jump farther in one step than the
+            # local resolution of the contour supports, otherwise the
+            # contour self-intersects / becomes geometrically meaningless.
+            # This is the ring-edge length for THIS contour, self-
+            # calibrating to contour size (tiny seeds get tiny max steps,
+            # large contours get larger ones) — no magic global constant.
+            #
+            # Without this, a single point with even a small per-step
+            # outward bias can run away into a spike over 40 autoregressive
+            # steps (linear accumulation with no negative feedback).
+            pts = xy[mask]
+            ring_next = np.roll(pts, -1, axis=0)
+            ring_edge_len = np.linalg.norm(pts - ring_next, axis=1).mean()
+            max_step = max(ring_edge_len * max_step_multiplier, 1e-4)
+
+            radial_clipped = np.minimum(radial_clipped, max_step)
+            tang_norm = np.linalg.norm(tangential, axis=1, keepdims=True)
+            scale = np.minimum(1.0, max_step / np.maximum(tang_norm, 1e-12))
+            tangential = tangential * scale
 
             pred_disp[mask] = radial_clipped * r_hat + tangential
 
