@@ -118,9 +118,9 @@ def rollout_trajectory(model, frames: np.ndarray, device,
     current_field = frames[0].copy()
 
     for t in range(T - 1):
-        # Extract boundary from current predicted field
-        xy = extract_boundary_points(current_field, n_points=n_nodes)
-        if xy is None:
+        # Extract multi-contour boundary from current predicted field
+        result = extract_boundary_points(current_field, n_points=n_nodes)
+        if result is None:
             # Crystal too small — copy ground truth to keep rollout alive
             current_field = frames[t + 1].copy()
             pred_fields.append(current_field.copy())
@@ -128,9 +128,10 @@ def rollout_trajectory(model, frames: np.ndarray, device,
             boundary_mse.append(0.0)
             field_mse.append(0.0)
             continue
+        xy, cid = result
 
-        feat  = compute_node_features(xy, current_field)
-        graph = build_graph(xy, feat, k=k)
+        feat  = compute_node_features(xy, current_field, cid)
+        graph = build_graph(xy, feat, cid, k=k)
         graph = graph.to(device)
 
         # Predict displacement
@@ -140,17 +141,20 @@ def rollout_trajectory(model, frames: np.ndarray, device,
         new_xy = xy + pred_disp
         new_xy = np.clip(new_xy, 0.0, 1.0)
 
-        # Get true next boundary for MSE
-        true_xy = extract_boundary_points(frames[t + 1], n_points=n_nodes)
-        if true_xy is not None:
-            b_mse = np.mean((new_xy - true_xy) ** 2)
+        # Get true next boundary for MSE — compare against a freshly
+        # extracted true boundary with the same total node budget
+        true_result = extract_boundary_points(frames[t + 1], n_points=n_nodes)
+        if true_result is not None:
+            true_xy, _ = true_result
+            n_cmp = min(len(true_xy), len(new_xy))
+            b_mse = np.mean((new_xy[:n_cmp] - true_xy[:n_cmp]) ** 2)
         else:
             b_mse = 0.0
         boundary_mse.append(b_mse)
 
-        # Reconstruct phase field from predicted boundary
+        # Reconstruct phase field from predicted boundary (per-contour fill)
         N_grid        = frames[0].shape[0]
-        pred_field    = boundary_to_field(new_xy, N=N_grid)
+        pred_field    = boundary_to_field(new_xy, cid, N=N_grid)
         current_field = pred_field
 
         pred_fields.append(pred_field.copy())
