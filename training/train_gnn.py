@@ -88,8 +88,20 @@ def split_graphs(graphs, val_frac=0.15, test_frac=0.15, seed=42):
 # ── One epoch ─────────────────────────────────────────────────────────────────
 
 def run_epoch(model, loader, loss_fn, device,
-              optimizer=None) -> float:
-    """Train or evaluate one epoch. Returns mean loss."""
+              optimizer=None, noise_std: float = 0.0) -> float:
+    """
+    Train or evaluate one epoch. Returns mean loss.
+
+    noise_std > 0 (training only): perturbs each node's input position
+    by Gaussian noise of this standard deviation, and adjusts the
+    target displacement so it still points at the TRUE next position.
+
+    This is the noise-injection technique from Sanchez-Gonzalez et al.
+    2020 ("Learning to Simulate Complex Physics with Graph Networks").
+    It teaches the model to correct small position errors back toward
+    the true trajectory, which directly counteracts the compounding
+    over-growth bias seen in autoregressive rollout.
+    """
     is_train = optimizer is not None
     model.train(is_train)
 
@@ -99,8 +111,29 @@ def run_epoch(model, loader, loss_fn, device,
     with ctx:
         for batch in loader:
             batch = batch.to(device)
-            pred  = model(batch)        # (N_total, 2)
 
+            if is_train and noise_std > 0:
+                old_pos = batch.pos
+                noise   = torch.randn_like(old_pos) * noise_std
+                new_pos = torch.clamp(old_pos + noise, 0.0, 1.0)
+                noise_applied = new_pos - old_pos   # actual delta after clamping
+
+                # Update position-derived input features to stay consistent:
+                #   x[:,0:2] = position
+                #   x[:,2:4] = position - domain centre (0.5, 0.5)
+                #   x[:,4]   = distance from domain centre
+                batch.x[:, 0:2] = new_pos
+                batch.x[:, 2:4] = new_pos - 0.5
+                batch.x[:, 4]   = torch.norm(new_pos - 0.5, dim=1)
+                batch.pos = new_pos
+
+                # Target must still point at the TRUE next position:
+                #   true_next = old_pos + original_y
+                #   new_y     = true_next - new_pos
+                #             = original_y - noise_applied
+                batch.y = batch.y - noise_applied
+
+            pred  = model(batch)        # (N_total, 2)
             loss = loss_fn(pred, batch.y, batch.pos)
 
             if is_train:
@@ -134,6 +167,10 @@ def main():
                     help='Length preservation loss weight')
     ap.add_argument('--patience', type=int,   default=20,
                     help='Early stopping patience')
+    ap.add_argument('--noise_std', type=float, default=0.0,
+                    help='Std-dev of position noise injected during '
+                         'training (combats compounding rollout error). '
+                         'Recommended: 0.004. 0 = disabled.')
     ap.add_argument('--seed',     type=int,   default=42)
     ap.add_argument('--val_frac', type=float, default=0.15)
     ap.add_argument('--test_frac',type=float, default=0.15)
@@ -147,6 +184,9 @@ def main():
     print(f"  Device:  {device}")
     print(f"  Graphs:  {args.graphs}")
     print(f"  Out dir: {args.out_dir}")
+    print(f"  Noise injection (rollout robustness): "
+          f"std={args.noise_std}"
+          f"{' (disabled)' if args.noise_std == 0 else ''}")
 
     # ── Load graphs ───────────────────────────────────────────────────────────
     print(f"\nLoading graphs...")
@@ -198,7 +238,8 @@ def main():
 
     for epoch in range(args.epochs):
         t0         = time.time()
-        train_loss = run_epoch(model, train_loader, loss_fn, device, optimizer)
+        train_loss = run_epoch(model, train_loader, loss_fn, device,
+                               optimizer, noise_std=args.noise_std)
         val_loss   = run_epoch(model, val_loader,   loss_fn, device)
         scheduler.step()
 
