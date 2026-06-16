@@ -24,10 +24,12 @@ data:
 
 # ----- Model ------------------------------------------------
 model:
-  modes: 16                 # Fourier modes kept per spatial axis. Verified
-                            # against the data: mode index m = wavenumber k*8
-                            # (L = 16*pi), and 99.999% of PFC spectral energy
-                            # lies below m = 16 -- this cutoff loses nothing.
+  modes: 24                 # Fourier modes kept per spatial axis. 16 already
+                            # captures 99.999% of CLEAN-lattice spectral energy
+                            # (mode m = wavenumber k*8, L = 16*pi), but sharp,
+                            # localized defects (grain boundaries, fronts) carry
+                            # broadband content -- 24 gives the network headroom
+                            # to represent them. Set back to 16 to ablate.
   width: 32                 # hidden channel width
   layers: 4                 # number of Fourier layers
   in_channels: 1            # density only; AUTO-bumped to 3 if conditioning on
@@ -51,6 +53,20 @@ train:
   step_size: 30             # (only used if scheduler == 'step')
   gamma: 0.5                # (only used if scheduler == 'step')
   grad_clip: 1.0            # max grad norm (0 disables)
+  # --- loss shaping (default 'none' = the clean MSE baseline) ---
+  loss_weight_mode: delta   # 'none' | 'delta' | 'gradient'. 'delta' weights the
+                            # MSE by |frame_t+1 - frame_t|, emphasizing growth
+                            # fronts / reorganizing grains -- the regions where
+                            # the surrogate locks in the wrong structure early.
+  loss_alpha: 5.0           # weighting strength (0 recovers plain MSE)
+  # --- multi-step / rollout training (1 = one-step teacher forcing) ---
+  rollout_steps: 4          # unroll this many steps per training sample so the
+                            # model sees its own error-compounding during
+                            # training (directly targets early divergence)
+  rollout_detach: true      # pushforward trick: feed back detached predictions
+                            # (one-step gradients on the rollout distribution;
+                            # stable). false = full backprop-through-time.
+  rollout_discount: 1.0     # per-step loss weight = discount**step (<=1)
   num_workers: 0            # DataLoader workers (0 is safest on macOS/MPS)
   device: auto              # 'auto' | 'cuda' | 'mps' | 'cpu'
   seed: 0
@@ -74,6 +90,7 @@ logging:
 # ----- Evaluation -------------------------------------------
 eval:
   rollout_length: 0         # 0 = roll out the full trajectory length
-  num_vis_trajectories: 3   # how many test rollouts to visualize
+  num_vis_trajectories: 8   # how many test rollouts to visualize (the WORST
+                            # by rollout MSE -- the informative failures)
   vis_frames: 6             # frames per rollout figure
   out_dir: runs/fno_baseline/eval

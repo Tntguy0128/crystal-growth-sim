@@ -46,6 +46,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 import yaml
@@ -92,6 +93,53 @@ def make_scheduler(optimizer, cfg):
         return torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=t["step_size"], gamma=t["gamma"])
     return None
+
+
+# ----------------------------------------------------------------------------
+#  Loss: MSE, optionally weighted toward dynamically active / complex regions
+# ----------------------------------------------------------------------------
+class PFCLoss(nn.Module):
+    """
+    Mean squared error with an optional per-pixel weight that emphasizes the
+    regions where the surrogate actually fails (growth fronts, grain
+    boundaries) -- a plain MSE barely notices a thin defect line because it is
+    a tiny fraction of the pixels.
+
+    weight_mode:
+      "none"     -- plain MSE (the clean baseline).
+      "delta"    -- weight by |target - prev|, the per-pixel CHANGE from the
+                    previous frame. Large where the crystal is actively
+                    growing / reorganizing; ~0 in settled regions. Directly
+                    targets the "locks in the wrong structure too early"
+                    failure. Needs `prev` (falls back to plain MSE without it).
+      "gradient" -- weight by the spatial gradient magnitude of the target
+                    (structure-rich regions). Note: a hex crystal oscillates
+                    everywhere, so this is less selective than "delta".
+
+    The weight is w = 1 + alpha * (indicator / per-sample max indicator), so
+    alpha=0 recovers plain MSE and the weighting is scale-free.
+    """
+
+    def __init__(self, weight_mode="none", alpha=5.0):
+        super().__init__()
+        self.weight_mode = weight_mode
+        self.alpha = float(alpha)
+
+    @staticmethod
+    def _grad_mag(f):
+        gx = F.pad(f[..., 1:, :] - f[..., :-1, :], (0, 0, 0, 1))
+        gy = F.pad(f[..., :, 1:] - f[..., :, :-1], (0, 1, 0, 0))
+        return torch.sqrt(gx * gx + gy * gy + 1e-12)
+
+    def forward(self, pred, target, prev=None):
+        se = (pred - target) ** 2
+        if self.weight_mode == "none" or self.alpha == 0.0 \
+                or (self.weight_mode == "delta" and prev is None):
+            return se.mean()
+        ind = self._grad_mag(target) if self.weight_mode == "gradient" \
+            else (target - prev).abs()
+        w = 1.0 + self.alpha * ind / (ind.amax(dim=(-2, -1), keepdim=True) + 1e-8)
+        return (w * se).mean()
 
 
 # ----------------------------------------------------------------------------
@@ -166,6 +214,78 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None,
                                       epoch * len(loader) + it)
     if is_train:
         print("\r" + " " * 70 + "\r", end="", flush=True)   # clear progress line
+    return total / max(n, 1)
+
+
+def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
+                rollout_steps, include_cond, n_cond,
+                rollout_detach=True, rollout_discount=1.0,
+                writer=None, epoch=0, log_every=20):
+    """
+    One training epoch. Handles both regimes:
+
+      * one-step  (rollout_steps == 1): batches are (x, y); standard
+        teacher-forced step. The weighted loss gets prev = x's density channel.
+
+      * multi-step (rollout_steps > 1): batches are (density0, cond, targets)
+        from PFCSequenceDataset. We unroll the model on its OWN predictions
+        for `rollout_steps`, summing a (optionally discounted) per-step loss.
+        `rollout_detach` feeds back detached predictions (the "pushforward"
+        trick): each step still gets a one-step gradient, but evaluated on the
+        model's slightly-off rollout distribution, which trains it to correct
+        its own drift without the instability of backprop-through-time.
+    """
+    model.train()
+    total, n = 0.0, 0
+    t0 = time.perf_counter()
+    for it, batch in enumerate(loader):
+        if rollout_steps > 1:
+            density0, cond, targets = batch
+            density0 = density0.to(device, non_blocking=True)   # (B,1,H,W)
+            targets = targets.to(device, non_blocking=True)     # (B,k,H,W)
+            B, _, H, W = density0.shape
+            cond_maps = None
+            if include_cond and cond.numel() > 0:
+                cond_maps = cond.to(device).view(B, n_cond, 1, 1).expand(
+                    B, n_cond, H, W)
+
+            cur, prev = density0, density0
+            loss, wsum = 0.0, 0.0
+            for j in range(targets.shape[1]):
+                inp = cur if cond_maps is None else torch.cat([cur, cond_maps], 1)
+                pred = model(inp)                               # (B,1,H,W)
+                w = rollout_discount ** j
+                loss = loss + w * loss_fn(pred, targets[:, j:j + 1], prev)
+                wsum += w
+                prev = targets[:, j:j + 1]                      # true previous frame
+                cur = pred.detach() if rollout_detach else pred
+            loss = loss / wsum
+            bs = B
+        else:
+            x, y = batch
+            x = x.to(device, non_blocking=True)
+            y = y.to(device, non_blocking=True)
+            pred = model(x)
+            loss = loss_fn(pred, y, x[:, :1])
+            bs = x.size(0)
+
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        if grad_clip and grad_clip > 0:
+            clip_grad_norm_(model.parameters(), grad_clip)
+        optimizer.step()
+
+        total += loss.item() * bs
+        n += bs
+        if (it + 1) % log_every == 0:
+            rate = (it + 1) / (time.perf_counter() - t0)
+            eta = (len(loader) - it - 1) / max(rate, 1e-9)
+            print(f"\r    batch {it + 1:4d}/{len(loader)}  loss {loss.item():.3e}  "
+                  f"{rate:4.1f} batch/s  eta {eta:4.0f}s ", end="", flush=True)
+            if writer is not None:
+                writer.add_scalar("batch/train_loss", loss.item(),
+                                  epoch * len(loader) + it)
+    print("\r" + " " * 70 + "\r", end="", flush=True)
     return total / max(n, 1)
 
 
@@ -293,7 +413,20 @@ def main():
         weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
     scheduler = make_scheduler(optimizer, cfg)
-    loss_fn = nn.MSELoss()           # pure MSE -- the clean PFC baseline
+    # Training loss: plain MSE by default; optionally weighted toward growth
+    # fronts / boundaries (config train.loss_weight_mode + loss_alpha).
+    loss_fn = PFCLoss(
+        weight_mode=cfg["train"].get("loss_weight_mode", "none"),
+        alpha=cfg["train"].get("loss_alpha", 5.0),
+    )
+    # Validation is always plain one-step MSE -> a stable, comparable scalar.
+    val_loss_fn = nn.MSELoss()
+    rollout_steps = info.get("rollout_steps", 1)
+    n_cond = info["in_channels"] - 1
+    print(f"Loss: weight_mode={cfg['train'].get('loss_weight_mode', 'none')} "
+          f"alpha={cfg['train'].get('loss_alpha', 5.0)}  |  "
+          f"rollout_steps={rollout_steps} "
+          f"(detach={cfg['train'].get('rollout_detach', True)})")
 
     # --- logging / checkpoints ---
     out_dir = cfg["logging"]["out_dir"]
@@ -336,11 +469,16 @@ def main():
     print("\nStarting training...\n")
     for epoch in range(es["epochs"]):
         t0 = time.time()
-        train_mse = run_epoch(
-            model, train_loader, loss_fn, device, optimizer=optimizer,
-            grad_clip=es.get("grad_clip", 0.0), writer=writer, epoch=epoch,
+        train_mse = train_epoch(
+            model, train_loader, loss_fn, device, optimizer,
+            grad_clip=es.get("grad_clip", 0.0),
+            rollout_steps=rollout_steps,
+            include_cond=info["include_conditioning"], n_cond=n_cond,
+            rollout_detach=es.get("rollout_detach", True),
+            rollout_discount=es.get("rollout_discount", 1.0),
+            writer=writer, epoch=epoch,
             log_every=cfg["logging"].get("log_every", 20))
-        val_mse = run_epoch(model, val_loader, loss_fn, device)
+        val_mse = run_epoch(model, val_loader, val_loss_fn, device)
 
         if scheduler is not None:
             scheduler.step()

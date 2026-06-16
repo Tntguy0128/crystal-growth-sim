@@ -33,6 +33,7 @@ PHYSICAL units (after undoing normalization).
 """
 
 import argparse
+import csv
 import os
 
 import numpy as np
@@ -43,7 +44,8 @@ import matplotlib.pyplot as plt
 
 import yaml
 
-from dataset import inspect_trajectory, _load_manifest, _run_id_from_path, _COND_COLUMNS
+from dataset import (inspect_trajectory, _load_manifest, _run_id_from_path,
+                     _COND_COLUMNS, trajectory_params)
 from fno_model import build_model
 
 
@@ -186,8 +188,26 @@ def rollout(model, path, normo, device, length=0):
 # ----------------------------------------------------------------------------
 #  4) Visualization
 # ----------------------------------------------------------------------------
-def plot_rollout(roll, path, out_png, n_frames=6):
-    """Top row: true PFC frames. Middle: FNO rollout. Bottom: abs error."""
+def _params_label(params):
+    """'r=-0.25  n0=-0.27  seed=point' from a trajectory_params dict."""
+    if not params:
+        return ""
+    def fmt(v):
+        try:
+            return f"{float(v):+.3f}"
+        except (TypeError, ValueError):
+            return str(v)
+    return (f"r={fmt(params.get('r'))}  n0={fmt(params.get('n0'))}  "
+            f"seed={params.get('seed_type')}")
+
+
+def plot_rollout(roll, path, out_png, n_frames=6, params=None):
+    """Top row: true PFC frames. Middle: FNO rollout. Bottom: abs error.
+
+    The figure title now states the physical parameters (r, n0, seed_type)
+    plus the trajectory's mean rollout MSE, so each saved figure is
+    self-describing.
+    """
     pred, true = roll["pred"], roll["true"]
     Lp1 = pred.shape[0]
     idx = np.linspace(0, Lp1 - 1, min(n_frames, Lp1), dtype=int)
@@ -197,7 +217,7 @@ def plot_rollout(roll, path, out_png, n_frames=6):
     err = np.abs(pred - true)
     emax = max(err[idx].max(), 1e-8)
 
-    fig, axes = plt.subplots(3, len(idx), figsize=(2.4 * len(idx), 7.2))
+    fig, axes = plt.subplots(3, len(idx), figsize=(2.4 * len(idx), 7.4))
     if len(idx) == 1:
         axes = axes.reshape(3, 1)
     for c, t in enumerate(idx):
@@ -210,8 +230,11 @@ def plot_rollout(roll, path, out_png, n_frames=6):
     axes[0, 0].set_ylabel("PFC (true)", fontsize=10)
     axes[1, 0].set_ylabel("FNO rollout", fontsize=10)
     axes[2, 0].set_ylabel("|error|", fontsize=10)
-    fig.suptitle(f"Rollout vs. ground truth — {os.path.basename(path)}",
-                 fontweight="bold")
+    label = _params_label(params)
+    fig.suptitle(
+        f"{os.path.basename(path)}    [ {label} ]    "
+        f"rollout MSE {roll['mse'].mean():.2e}",
+        fontweight="bold", fontsize=11)
     fig.tight_layout()
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
     plt.close(fig)
@@ -278,39 +301,78 @@ def main():
     # 1) One-step MSE
     os_mse = one_step_mse(model, test_files, normo, device)
 
-    # 2+3) Rollouts over the whole test set
+    # 2+3) Rollouts over the whole test set, tagged with physical parameters
     L = cfg["eval"].get("rollout_length", 0)
-    all_mse, all_mass, final_mse = [], [], []
-    rolls = []
+    all_mse, all_mass = [], []
+    records = []        # one per trajectory, carries params + scores + the roll
     for path in test_files:
         roll = rollout(model, path, normo, device, length=L)
         all_mse.append(roll["mse"])
         all_mass.append(roll["mass_err"])
-        final_mse.append(roll["mse"][-1])
-        rolls.append((path, roll))
+        p = trajectory_params(path, manifest)
+        records.append({
+            "run": _run_id_from_path(path),
+            "path": path,
+            "r": p.get("r"), "n0": p.get("n0"), "seed_type": p.get("seed_type"),
+            "rollout_mse": float(roll["mse"].mean()),
+            "final_mse": float(roll["mse"][-1]),
+            "mass_err": float(roll["mass_err"][-1]),
+            "roll": roll,
+        })
 
-    rollout_mse_mean = float(np.mean([m.mean() for m in all_mse]))
-    final_step_mse = float(np.mean(final_mse))
-    mass_err_final = float(np.mean([m[-1] for m in all_mass]))
+    rollout_mse_mean = float(np.mean([r["rollout_mse"] for r in records]))
+    final_step_mse = float(np.mean([r["final_mse"] for r in records]))
+    mass_err_final = float(np.mean([r["mass_err"] for r in records]))
 
-    # 4) Visualizations
-    n_vis = min(cfg["eval"].get("num_vis_trajectories", 3), len(rolls))
-    for path, roll in rolls[:n_vis]:
-        name = os.path.splitext(os.path.basename(path))[0]
-        plot_rollout(roll, path, os.path.join(out_dir, f"rollout_{name}.png"),
-                     n_frames=cfg["eval"].get("vis_frames", 6))
+    # 4) Visualizations -- show the WORST trajectories (most informative),
+    #    each figure labeled with its r / n0 / seed_type.
+    n_vis = min(cfg["eval"].get("num_vis_trajectories", 6), len(records))
+    worst = sorted(records, key=lambda r: r["rollout_mse"], reverse=True)[:n_vis]
+    for rec in worst:
+        name = os.path.splitext(os.path.basename(rec["path"]))[0]
+        plot_rollout(rec["roll"], rec["path"],
+                     os.path.join(out_dir, f"rollout_{name}.png"),
+                     n_frames=cfg["eval"].get("vis_frames", 6),
+                     params=rec)
     plot_curves(all_mse, all_mass, os.path.join(out_dir, "rollout_curves.png"))
 
+    # 5) Per-trajectory CSV + grouped diagnostics (which regime fails?)
+    csv_path = os.path.join(out_dir, "per_trajectory.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["run", "r", "n0", "seed_type",
+                    "rollout_mse", "final_mse", "mass_err"])
+        for rec in sorted(records, key=lambda r: r["run"]):
+            w.writerow([rec["run"], rec["r"], rec["n0"], rec["seed_type"],
+                        f"{rec['rollout_mse']:.6e}", f"{rec['final_mse']:.6e}",
+                        f"{rec['mass_err']:.3e}"])
+
+    def grouped(key):
+        groups = {}
+        for rec in records:
+            groups.setdefault(str(rec[key]), []).append(rec["rollout_mse"])
+        return {k: (np.mean(v), len(v)) for k, v in sorted(groups.items())}
+
     # --- report ---
-    print("\n" + "=" * 56)
+    print("\n" + "=" * 60)
     print("  EVALUATION SUMMARY  (test split, physical units)")
-    print("=" * 56)
+    print("=" * 60)
     print(f"  1) One-step prediction MSE (normalized) : {os_mse:.4e}")
     print(f"  2) Rollout MSE  (mean over horizon)     : {rollout_mse_mean:.4e}")
     print(f"     Rollout MSE  (final step)            : {final_step_mse:.4e}")
     print(f"  3) Relative mass error (final step)     : {mass_err_final:.4e}")
-    print(f"  4) Figures written to                   : {out_dir}/")
-    print("=" * 56)
+    print("\n  Rollout MSE grouped by seed_type:")
+    for k, (mean, n) in grouped("seed_type").items():
+        print(f"      {k:<12s} {mean:.4e}   (n={n})")
+    print("\n  Rollout MSE grouped by r:")
+    for k, (mean, n) in grouped("r").items():
+        print(f"      r={k:<8s} {mean:.4e}   (n={n})")
+    print("\n  Worst trajectories (visualized):")
+    for rec in worst:
+        print(f"      traj_{rec['run']}  {_params_label(rec):<34s} "
+              f"MSE {rec['rollout_mse']:.3e}")
+    print(f"\n  Figures + per_trajectory.csv written to: {out_dir}/")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

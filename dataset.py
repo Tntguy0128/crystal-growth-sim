@@ -161,6 +161,26 @@ def _run_id_from_path(path):
     return m.group(1) if m else None
 
 
+def trajectory_params(path, manifest=None):
+    """
+    The physical parameters of a trajectory, for labeling/grouping at eval
+    time: {'r', 'n0', 'seed_type'}. Resolved from the manifest first (cheap),
+    falling back to the npz metadata. Values are returned as-is (strings from
+    the manifest, native types from the npz) -- callers float() the numerics.
+    """
+    manifest = manifest or {}
+    row = manifest.get(_run_id_from_path(path), {})
+    out, meta = {}, None
+    for col in ("r", "n0", "seed_type"):
+        if col in row:
+            out[col] = row[col]
+        else:
+            if meta is None:
+                meta = inspect_trajectory(path)["meta"]
+            out[col] = meta.get(col)
+    return out
+
+
 # ----------------------------------------------------------------------------
 #  Torch Dataset
 # ----------------------------------------------------------------------------
@@ -249,6 +269,75 @@ class PFCPairDataset(Dataset):
             x = torch.cat([x] + cond_channels, dim=0)       # (1 + n_cond, H, W)
 
         return x, y
+
+
+class PFCSequenceDataset(Dataset):
+    """
+    Like PFCPairDataset, but each item is a short CONSECUTIVE sequence used for
+    multi-step ("rollout" / "pushforward") training:
+
+        density0 : (1, H, W)     normalized initial frame n_t
+        cond     : (n_cond,)     conditioning vector (r, n0); empty if disabled
+        targets  : (k, H, W)     normalized true frames n_t+1 .. n_t+k
+
+    The training loop feeds density0 in, predicts n_t+1, feeds its own
+    prediction back, predicts n_t+2, and so on for k steps, summing the loss.
+    This exposes the model during training to the same error-compounding it
+    faces at rollout time -- which is exactly where the one-step model "locks
+    in" the wrong structure early. Reuses the same normalization, conditioning,
+    and per-trajectory splitting as the pair dataset.
+    """
+
+    def __init__(self, files, k, manifest=None, norm_mean=None, norm_std=None,
+                 include_conditioning=False, cond_stats=None):
+        self.k = int(k)
+        self.norm_mean = norm_mean
+        self.norm_std = norm_std
+        self.include_conditioning = include_conditioning
+        self.cond_stats = cond_stats
+
+        self._full = []     # full (T, H, W) trajectory per file (frames 0..T-1)
+        self.cond = []      # normalized conditioning vector per file
+        self.index = []     # (file_idx, start_frame) with start+k <= T-1
+        for fi, path in enumerate(files):
+            rec = inspect_trajectory(path)
+            full = np.concatenate([rec["inputs"], rec["targets"][-1:]], axis=0)
+            self._full.append(full.astype(np.float32))
+
+            run = _run_id_from_path(path)
+            mrow = (manifest or {}).get(run, {})
+            vals = []
+            for col in _COND_COLUMNS:
+                if col in mrow:
+                    vals.append(float(mrow[col]))
+                elif col in rec["meta"]:
+                    vals.append(float(rec["meta"][col]))
+                else:
+                    vals.append(0.0)
+            cond = np.asarray(vals, dtype=np.float32)
+            if cond_stats is not None:
+                cond = (cond - cond_stats["mean"]) / (cond_stats["std"] + 1e-8)
+            self.cond.append(cond)
+
+            T = full.shape[0]
+            for s in range(0, T - self.k):          # need frames s .. s+k
+                self.index.append((fi, s))
+
+    def __len__(self):
+        return len(self.index)
+
+    def _normalize(self, a):
+        if self.norm_mean is None or self.norm_std is None:
+            return a
+        return (a - self.norm_mean) / (self.norm_std + 1e-8)
+
+    def __getitem__(self, idx):
+        fi, s = self.index[idx]
+        seq = self._normalize(self._full[fi][s:s + self.k + 1])     # (k+1, H, W)
+        density0 = torch.from_numpy(np.ascontiguousarray(seq[0])).unsqueeze(0)
+        targets = torch.from_numpy(np.ascontiguousarray(seq[1:]))    # (k, H, W)
+        cond = torch.from_numpy(np.ascontiguousarray(self.cond[fi]))  # (n_cond,)
+        return density0, cond, targets
 
 
 # ----------------------------------------------------------------------------
@@ -415,7 +504,7 @@ def build_datasets(cfg):
     if include_conditioning and d.get("normalize_conditioning", True):
         cond_stats = compute_cond_stats(train_files, manifest)
 
-    def make(fs):
+    def make_pairs(fs):
         return PFCPairDataset(
             fs, manifest=manifest,
             norm_mean=norm_mean, norm_std=norm_std,
@@ -423,8 +512,22 @@ def build_datasets(cfg):
             cond_stats=cond_stats,
         )
 
+    # Multi-step training: the TRAIN set becomes a sequence dataset (k-step
+    # rollouts). Validation/test stay one-step pairs so the early-stopping
+    # metric is a stable, comparable scalar across configs.
+    rollout_steps = int(cfg.get("train", {}).get("rollout_steps", 1))
+    if rollout_steps > 1:
+        train_ds = PFCSequenceDataset(
+            train_files, k=rollout_steps, manifest=manifest,
+            norm_mean=norm_mean, norm_std=norm_std,
+            include_conditioning=include_conditioning, cond_stats=cond_stats,
+        )
+    else:
+        train_ds = make_pairs(train_files)
+
     info = {
         "split_by": split_by,
+        "rollout_steps": rollout_steps,
         "norm_mean": norm_mean,
         "norm_std": norm_std,
         "include_conditioning": include_conditioning,
@@ -434,7 +537,7 @@ def build_datasets(cfg):
         "val_files": val_files,
         "test_files": test_files,
     }
-    return make(train_files), make(val_files), make(test_files), info
+    return train_ds, make_pairs(val_files), make_pairs(test_files), info
 
 
 # ----------------------------------------------------------------------------
