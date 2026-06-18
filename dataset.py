@@ -217,13 +217,16 @@ class PFCPairDataset(Dataset):
         self._records = []          # one inspect_trajectory() dict per file
         self.index = []             # list of (file_idx, pair_idx)
         self.cond = []              # per-file conditioning vector [r, n0]
+        self.r_phys = []            # per-file PHYSICAL r (for the free-energy loss)
         for fi, path in enumerate(files):
             rec = inspect_trajectory(path)
             self._records.append(rec)
             n_pairs = rec["inputs"].shape[0]
             for pi in range(n_pairs):
                 self.index.append((fi, pi))
-            self.cond.append(self._conditioning_vector(rec, path))
+            cond = self._conditioning_vector(rec, path)
+            self.cond.append(cond)
+            self.r_phys.append(float(cond[0]))      # _COND_COLUMNS[0] == 'r'
 
     def _conditioning_vector(self, rec, path):
         """Resolve [r, n0] for a trajectory from manifest first, then npz meta."""
@@ -268,7 +271,10 @@ class PFCPairDataset(Dataset):
             ]
             x = torch.cat([x] + cond_channels, dim=0)       # (1 + n_cond, H, W)
 
-        return x, y
+        # r_phys is returned for the (optional) free-energy physics loss; the
+        # one-step/MSE paths simply ignore the third element.
+        r = torch.tensor(self.r_phys[fi], dtype=torch.float32)
+        return x, y, r
 
 
 class PFCSequenceDataset(Dataset):
@@ -298,6 +304,7 @@ class PFCSequenceDataset(Dataset):
 
         self._full = []     # full (T, H, W) trajectory per file (frames 0..T-1)
         self.cond = []      # normalized conditioning vector per file
+        self.r_phys = []    # per-file PHYSICAL r (for the free-energy loss)
         self.index = []     # (file_idx, start_frame) with start+k <= T-1
         for fi, path in enumerate(files):
             rec = inspect_trajectory(path)
@@ -314,7 +321,9 @@ class PFCSequenceDataset(Dataset):
                     vals.append(float(rec["meta"][col]))
                 else:
                     vals.append(0.0)
-            cond = np.asarray(vals, dtype=np.float32)
+            vals = np.asarray(vals, dtype=np.float32)
+            self.r_phys.append(float(vals[0]))      # physical r, before normalization
+            cond = vals
             if cond_stats is not None:
                 cond = (cond - cond_stats["mean"]) / (cond_stats["std"] + 1e-8)
             self.cond.append(cond)
@@ -337,7 +346,8 @@ class PFCSequenceDataset(Dataset):
         density0 = torch.from_numpy(np.ascontiguousarray(seq[0])).unsqueeze(0)
         targets = torch.from_numpy(np.ascontiguousarray(seq[1:]))    # (k, H, W)
         cond = torch.from_numpy(np.ascontiguousarray(self.cond[fi]))  # (n_cond,)
-        return density0, cond, targets
+        r = torch.tensor(self.r_phys[fi], dtype=torch.float32)
+        return density0, cond, targets, r
 
 
 # ----------------------------------------------------------------------------
@@ -525,9 +535,21 @@ def build_datasets(cfg):
     else:
         train_ds = make_pairs(train_files)
 
+    # Physical grid spacing dx, needed by the free-energy physics loss.
+    # Prefer the value stored in the npz; else L/N; else config domain_L / N.
+    rec0 = inspect_trajectory(train_files[0])
+    H0 = rec0["inputs"].shape[-1]
+    if "dx" in rec0["meta"]:
+        dx = float(rec0["meta"]["dx"])
+    elif "L" in rec0["meta"]:
+        dx = float(rec0["meta"]["L"]) / H0
+    else:
+        dx = float(d.get("domain_L", 16.0 * np.pi)) / H0
+
     info = {
         "split_by": split_by,
         "rollout_steps": rollout_steps,
+        "dx": dx,
         "norm_mean": norm_mean,
         "norm_std": norm_std,
         "include_conditioning": include_conditioning,

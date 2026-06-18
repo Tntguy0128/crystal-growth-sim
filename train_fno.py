@@ -40,6 +40,7 @@ preprocessing and evaluates on the held-out test trajectories.
 """
 
 import argparse
+import math
 import os
 import time
 
@@ -143,6 +144,66 @@ class PFCLoss(nn.Module):
 
 
 # ----------------------------------------------------------------------------
+#  Free-energy dissipation penalty (physics-informed, step 1)
+# ----------------------------------------------------------------------------
+class FreeEnergyDissipation(nn.Module):
+    """
+    A thermodynamic soft constraint: PFC is a gradient flow, so its free
+    energy F[n] can only DECREASE in time. This penalizes any predicted step
+    whose free energy is higher than the frame it evolved from.
+
+    The free energy is the same functional the solver/sanity-checks use
+    (see pfc_solver.compute_free_energy), evaluated spectrally:
+
+        F[n] = sum( n(lap n + 1/2 lap^2 n) + 1/2 (1+r) n^2 + 1/4 n^4 ) dx^2
+
+    Two practical points:
+      * The field is z-score normalized during training, but F is defined on
+        the PHYSICAL field, so we denormalize (n = n_norm*std + mean) first.
+      * We penalize the RELATIVE increase relu((F_pred - F_prev)/|F_prev|),
+        which is dimensionless and ~O(1), so the weight is easy to set and the
+        prefactor dx^2 cancels out. On clean ground-truth data this term is ~0
+        (F genuinely decreases), so it never fights correct predictions -- it
+        only activates when the model proposes an energy-increasing, and hence
+        unphysical, step. This is an inequality, so it is robust to the coarse
+        frame spacing dt (unlike a full PDE residual).
+    """
+
+    def __init__(self, norm_mean, norm_std, dx):
+        super().__init__()
+        self.mean = float(norm_mean)
+        self.std = float(norm_std)
+        self.dx = float(dx)
+        self._k2 = None          # cached |k|^2 grid (built lazily per device/size)
+
+    def _k2_grid(self, H, W, device):
+        if (self._k2 is None or tuple(self._k2.shape) != (H, W)
+                or self._k2.device != device):
+            kx = torch.fft.fftfreq(H, d=self.dx, device=device) * 2 * math.pi
+            ky = torch.fft.fftfreq(W, d=self.dx, device=device) * 2 * math.pi
+            KX, KY = torch.meshgrid(kx, ky, indexing="ij")
+            self._k2 = KX ** 2 + KY ** 2
+        return self._k2
+
+    def free_energy(self, n_norm, r):
+        """n_norm: (B,1,H,W) normalized field; r: (B,) physical -> F: (B,)."""
+        n = n_norm * self.std + self.mean
+        B, _, H, W = n.shape
+        k2 = self._k2_grid(H, W, n.device)
+        nh = torch.fft.fft2(n)
+        lap_n = torch.fft.ifft2(-k2 * nh).real
+        laplap_n = torch.fft.ifft2(k2 ** 2 * nh).real
+        rr = r.view(B, 1, 1, 1)
+        integ = n * (lap_n + 0.5 * laplap_n) + 0.5 * (1.0 + rr) * n ** 2 + 0.25 * n ** 4
+        return integ.sum(dim=(-2, -1)).squeeze(1) * self.dx ** 2
+
+    def forward(self, pred_norm, prev_norm, r):
+        F_pred = self.free_energy(pred_norm, r)
+        F_prev = self.free_energy(prev_norm, r)
+        return torch.relu((F_pred - F_prev) / (F_prev.abs() + 1e-8)).mean()
+
+
+# ----------------------------------------------------------------------------
 #  Gradient clipping that works with the FNO's complex spectral weights
 # ----------------------------------------------------------------------------
 def clip_grad_norm_(parameters, max_norm):
@@ -185,7 +246,8 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None,
     t0 = time.perf_counter()
     grad_ctx = torch.enable_grad() if is_train else torch.no_grad()
     with grad_ctx:
-        for it, (x, y) in enumerate(loader):
+        for it, batch in enumerate(loader):
+            x, y = batch[0], batch[1]             # (third element r is unused here)
             x = x.to(device, non_blocking=True)   # (B, C, H, W)  frame_t
             y = y.to(device, non_blocking=True)   # (B, 1, H, W)  frame_t+1
 
@@ -220,29 +282,37 @@ def run_epoch(model, loader, loss_fn, device, optimizer=None,
 def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                 rollout_steps, include_cond, n_cond,
                 rollout_detach=True, rollout_discount=1.0,
+                fe_penalty=None, physics_weight=0.0,
                 writer=None, epoch=0, log_every=20):
     """
     One training epoch. Handles both regimes:
 
-      * one-step  (rollout_steps == 1): batches are (x, y); standard
+      * one-step  (rollout_steps == 1): batches are (x, y, r); standard
         teacher-forced step. The weighted loss gets prev = x's density channel.
 
-      * multi-step (rollout_steps > 1): batches are (density0, cond, targets)
+      * multi-step (rollout_steps > 1): batches are (density0, cond, targets, r)
         from PFCSequenceDataset. We unroll the model on its OWN predictions
         for `rollout_steps`, summing a (optionally discounted) per-step loss.
         `rollout_detach` feeds back detached predictions (the "pushforward"
         trick): each step still gets a one-step gradient, but evaluated on the
         model's slightly-off rollout distribution, which trains it to correct
         its own drift without the instability of backprop-through-time.
+
+    If `physics_weight > 0` and `fe_penalty` is given, a free-energy
+    dissipation term (relu of the relative energy increase from the previous
+    frame) is added: total = data_loss + physics_weight * energy_penalty.
+    Returns (mean data loss, mean energy penalty).
     """
     model.train()
-    total, n = 0.0, 0
+    total, total_pen, n = 0.0, 0.0, 0
+    use_fe = fe_penalty is not None and physics_weight > 0
     t0 = time.perf_counter()
     for it, batch in enumerate(loader):
         if rollout_steps > 1:
-            density0, cond, targets = batch
+            density0, cond, targets, r = batch
             density0 = density0.to(device, non_blocking=True)   # (B,1,H,W)
             targets = targets.to(device, non_blocking=True)     # (B,k,H,W)
+            r = r.to(device, non_blocking=True)
             B, _, H, W = density0.shape
             cond_maps = None
             if include_cond and cond.numel() > 0:
@@ -250,43 +320,55 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                     B, n_cond, H, W)
 
             cur, prev = density0, density0
-            loss, wsum = 0.0, 0.0
+            data_loss, pen, wsum = 0.0, 0.0, 0.0
             for j in range(targets.shape[1]):
                 inp = cur if cond_maps is None else torch.cat([cur, cond_maps], 1)
                 pred = model(inp)                               # (B,1,H,W)
                 w = rollout_discount ** j
-                loss = loss + w * loss_fn(pred, targets[:, j:j + 1], prev)
+                data_loss = data_loss + w * loss_fn(pred, targets[:, j:j + 1], prev)
+                if use_fe:
+                    pen = pen + w * fe_penalty(pred, prev, r)
                 wsum += w
                 prev = targets[:, j:j + 1]                      # true previous frame
                 cur = pred.detach() if rollout_detach else pred
-            loss = loss / wsum
+            data_loss = data_loss / wsum
+            pen = pen / wsum if use_fe else torch.zeros((), device=device)
             bs = B
         else:
-            x, y = batch
+            x, y, r = batch
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
+            r = r.to(device, non_blocking=True)
             pred = model(x)
-            loss = loss_fn(pred, y, x[:, :1])
+            data_loss = loss_fn(pred, y, x[:, :1])
+            pen = fe_penalty(pred, x[:, :1], r) if use_fe \
+                else torch.zeros((), device=device)
             bs = x.size(0)
 
+        loss = data_loss + physics_weight * pen
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip and grad_clip > 0:
             clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
-        total += loss.item() * bs
+        total += data_loss.item() * bs
+        total_pen += float(pen.detach()) * bs
         n += bs
         if (it + 1) % log_every == 0:
             rate = (it + 1) / (time.perf_counter() - t0)
             eta = (len(loader) - it - 1) / max(rate, 1e-9)
-            print(f"\r    batch {it + 1:4d}/{len(loader)}  loss {loss.item():.3e}  "
-                  f"{rate:4.1f} batch/s  eta {eta:4.0f}s ", end="", flush=True)
+            extra = f"  Epen {float(pen.detach()):.2e}" if use_fe else ""
+            print(f"\r    batch {it + 1:4d}/{len(loader)}  data {data_loss.item():.3e}"
+                  f"{extra}  {rate:4.1f} batch/s  eta {eta:4.0f}s ", end="", flush=True)
             if writer is not None:
-                writer.add_scalar("batch/train_loss", loss.item(),
+                writer.add_scalar("batch/train_data_loss", data_loss.item(),
                                   epoch * len(loader) + it)
+                if use_fe:
+                    writer.add_scalar("batch/train_energy_penalty", float(pen.detach()),
+                                      epoch * len(loader) + it)
     print("\r" + " " * 70 + "\r", end="", flush=True)
-    return total / max(n, 1)
+    return total / max(n, 1), total_pen / max(n, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -423,10 +505,20 @@ def main():
     val_loss_fn = nn.MSELoss()
     rollout_steps = info.get("rollout_steps", 1)
     n_cond = info["in_channels"] - 1
+
+    # Physics-informed free-energy dissipation penalty (step 1). physics_weight
+    # = 0 recovers the pure-data baseline.
+    physics_weight = float(cfg["train"].get("physics_weight", 0.0))
+    fe_penalty = None
+    if physics_weight > 0:
+        fe_penalty = FreeEnergyDissipation(
+            info["norm_mean"], info["norm_std"], info["dx"]).to(device)
+
     print(f"Loss: weight_mode={cfg['train'].get('loss_weight_mode', 'none')} "
           f"alpha={cfg['train'].get('loss_alpha', 5.0)}  |  "
           f"rollout_steps={rollout_steps} "
-          f"(detach={cfg['train'].get('rollout_detach', True)})")
+          f"(detach={cfg['train'].get('rollout_detach', True)})  |  "
+          f"physics_weight={physics_weight} (free-energy dissipation, dx={info['dx']:.4f})")
 
     # --- logging / checkpoints ---
     out_dir = cfg["logging"]["out_dir"]
@@ -469,13 +561,14 @@ def main():
     print("\nStarting training...\n")
     for epoch in range(es["epochs"]):
         t0 = time.time()
-        train_mse = train_epoch(
+        train_mse, train_pen = train_epoch(
             model, train_loader, loss_fn, device, optimizer,
             grad_clip=es.get("grad_clip", 0.0),
             rollout_steps=rollout_steps,
             include_cond=info["include_conditioning"], n_cond=n_cond,
             rollout_detach=es.get("rollout_detach", True),
             rollout_discount=es.get("rollout_discount", 1.0),
+            fe_penalty=fe_penalty, physics_weight=physics_weight,
             writer=writer, epoch=epoch,
             log_every=cfg["logging"].get("log_every", 20))
         val_mse = run_epoch(model, val_loader, val_loss_fn, device)
@@ -488,6 +581,8 @@ def main():
             writer.add_scalar("epoch/train_mse", train_mse, epoch)
             writer.add_scalar("epoch/val_mse", val_mse, epoch)
             writer.add_scalar("epoch/lr", lr_now, epoch)
+            if physics_weight > 0:
+                writer.add_scalar("epoch/train_energy_penalty", train_pen, epoch)
 
         # Periodic autoregressive rollout on val trajectories: the metric a
         # surrogate actually lives or dies by, watched during training.
@@ -514,8 +609,9 @@ def main():
             epochs_no_improve += 1
 
         save_ckpt(last_path, epoch, val_mse)
+        pen_note = f"  Epen {train_pen:.2e}" if physics_weight > 0 else ""
         print(f"epoch {epoch:3d}/{es['epochs']}  "
-              f"train {train_mse:.3e}  val {val_mse:.3e}  "
+              f"train {train_mse:.3e}{pen_note}  val {val_mse:.3e}  "
               f"lr {lr_now:.2e}  {dt:.1f}s{roll_note}{flag}")
 
         if es.get("early_stopping", False) and epochs_no_improve >= es["patience"]:

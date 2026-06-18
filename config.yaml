@@ -17,6 +17,8 @@ data:
                             # datasets (--ensemble N): keeps all noise
                             # realizations of one (r, n0, seed_type) in the
                             # same split, preventing near-duplicate leakage.
+  domain_L: 50.26548245744  # physical domain size (= 16*pi); only a fallback for
+                            # the free-energy loss when dx/L aren't in the npz.
   normalize: true           # z-score the density field using train-set stats
   # --- conditioning (optional; keep false for the clean MSE baseline) ---
   include_conditioning: false   # append r, n0 as extra input channels
@@ -67,6 +69,13 @@ train:
                             # (one-step gradients on the rollout distribution;
                             # stable). false = full backprop-through-time.
   rollout_discount: 1.0     # per-step loss weight = discount**step (<=1)
+  # --- physics-informed free-energy dissipation penalty (step 1) ---
+  physics_weight: 0.1       # weight on relu(relative free-energy increase). PFC
+                            # is a gradient flow, so F[n] must not rise; this
+                            # penalizes unphysical energy-increasing predictions.
+                            # 0 = pure-data baseline. The term is dimensionless
+                            # and ~0 on clean data, so it never fights correct
+                            # predictions -- only unphysical ones.
   num_workers: 0            # DataLoader workers (0 is safest on macOS/MPS)
   device: auto              # 'auto' | 'cuda' | 'mps' | 'cpu'
   seed: 0
