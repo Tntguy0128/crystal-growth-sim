@@ -1,0 +1,65 @@
+# ============================================================
+#  Grain-rich PFC dataset
+#  5 r x 3 n0 x 3 seed types x 2 ensembles = 90 runs
+#  Use:  python generate_dataset.py --sweep --config pfc_config_grains.yaml
+# ============================================================
+# Built to fix the observed weakness: the FNO handles single-crystal (hex)
+# growth well but struggles on grain-boundary microstructures (point, multi).
+# This dataset is deliberately rich in grain structure:
+#   * n_seeds = 30  -> multi-seed runs nucleate a real many-grain network
+#     (the old dataset used n_seeds = 5, which merged to ~one crystal almost
+#      immediately and gave the model almost no grain-boundary frames)
+#   * only STABLE quenches (r <= -0.25); r = -0.20 is dropped because at this
+#     density the crystal MELTS rather than coarsens (measured) -- a different
+#     phenomenon that would just confuse the surrogate
+#   * seed_k0 = 1.0 so seeds grow FROM where they are planted
+#   * T / save_every unchanged -> dt between frames stays 6.25, so the FNO
+#     still learns the SAME one-step map as before (do not change this)
+
+run:
+  # physics
+  r: -0.30
+  n0: -0.285
+  M: 1.0
+
+  # grid
+  N: 128
+  L: 50.26548245743669      # 16 * pi
+
+  # time  (dt_frame = save_every * dt = 6.25 -- MUST match the FNO's step)
+  dt: 0.25
+  T: 250.0
+  save_every: 25            # -> 40 frames per trajectory
+
+  # initial condition
+  seed_type: multi
+  rng_seed: 42
+  noise_amplitude: 0.01
+  seed_amplitude: 0.20
+  n_seeds: 30               # KEY: many nuclei -> rich grain-boundary network
+  seed_k0: 1.0
+
+  # output
+  output_dir: data_pfc_grains
+  save_plots: false
+  save_animation: false
+
+  # sanity checks
+  mass_drift_tol: 1.0e-5
+  energy_increase_tol: 1.0e-3
+
+# ----- Sweep: stable quenches only, all three seed types, 2 noise realizations
+sweep:
+  r_values: [-0.25, -0.28, -0.30, -0.33, -0.40]   # all stable (no melting)
+  n0_values: [-0.27, -0.285, -0.30]
+  seed_types: [hex, point, multi]                  # keep hex for generalization
+  n_ensemble: 2                                    # -> 5*3*3*2 = 90 runs
+  base_rng_seed: 2000
+  skip_existing: false
+  parallel: true
+  max_workers: 4
+
+# NOTE for FNO training on this dataset (config.yaml):
+#   data:
+#     data_dir: data_pfc_grains
+#     split_by: config        # keep ensemble members of one config together
