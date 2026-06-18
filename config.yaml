@@ -81,7 +81,12 @@ train:
   seed: 0
   # --- early stopping ---
   early_stopping: true
-  patience: 15              # stop after this many epochs without val improvement
+  patience: 30              # bumped from 15: the grain run found its best val
+                            # at ~epoch 2 and stopped at 17, but we couldn't
+                            # tell whether it had truly converged or was just
+                            # stuck in the phase-offset basin. A longer patience
+                            # lets the full curve emerge (esp. after the cosine
+                            # LR drops) so the plateau is real, not premature.
   min_delta: 0.000001       # minimum val-loss improvement that counts
   # --- rollout validation (logged during training; 0 disables) ---
   rollout_val_every: 10     # every N epochs, run autoregressive rollouts on

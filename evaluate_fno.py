@@ -154,6 +154,14 @@ def rollout(model, path, normo, device, length=0):
         pred   : (L+1, H, W) physical-unit predicted fields (incl. frame_0)
         true   : (L+1, H, W) physical-unit ground-truth fields
         mse    : (L,) per-step MSE in physical units, pred vs true
+        spec_mse : (L,) per-step PHASE-INSENSITIVE error -- MSE of |FFT(pred)|
+                   vs |FFT(true)|. By the Fourier shift theorem a spatial
+                   translation only rotates the FFT phase, leaving the
+                   magnitude unchanged; the PFC solver is periodic, so a
+                   lattice "phase registration" offset is exactly a circular
+                   translation and contributes ~0 here. A trajectory with
+                   high `mse` but low `spec_mse` is structurally correct but
+                   pixel-shifted (benign); high on both is genuinely wrong.
         mass_err : (L+1,) relative |mean(pred)-mean(true)| / |mean(true)|
     """
     rec = inspect_trajectory(path)
@@ -178,11 +186,20 @@ def rollout(model, path, normo, device, length=0):
     true_cut = true_phys[:L + 1]
 
     mse = np.mean((preds_phys[1:] - true_cut[1:]) ** 2, axis=(1, 2))   # (L,)
+
+    # Phase-insensitive spectral-magnitude error. norm="ortho" keeps the
+    # magnitudes in the same energy units as the field (Parseval), so spec_mse
+    # is directly comparable in scale to the pixel mse above.
+    Fp = np.abs(np.fft.rfft2(preds_phys[1:], axes=(-2, -1), norm="ortho"))
+    Ft = np.abs(np.fft.rfft2(true_cut[1:], axes=(-2, -1), norm="ortho"))
+    spec_mse = np.mean((Fp - Ft) ** 2, axis=(1, 2))                    # (L,)
+
     pred_mean = preds_phys.mean(axis=(1, 2))
     true_mean = true_cut.mean(axis=(1, 2))
     mass_err = np.abs(pred_mean - true_mean) / (np.abs(true_mean) + 1e-12)
 
-    return {"pred": preds_phys, "true": true_cut, "mse": mse, "mass_err": mass_err}
+    return {"pred": preds_phys, "true": true_cut, "mse": mse,
+            "spec_mse": spec_mse, "mass_err": mass_err}
 
 
 # ----------------------------------------------------------------------------
@@ -231,9 +248,13 @@ def plot_rollout(roll, path, out_png, n_frames=6, params=None):
     axes[1, 0].set_ylabel("FNO rollout", fontsize=10)
     axes[2, 0].set_ylabel("|error|", fontsize=10)
     label = _params_label(params)
+    pix = roll["mse"].mean()
+    spec = roll["spec_mse"].mean()
+    # Flag the benign phase-offset regime: structure right, pixels shifted.
+    tag = "  [phase-offset]" if (pix > 5e-2 and spec < 0.3 * pix) else ""
     fig.suptitle(
         f"{os.path.basename(path)}    [ {label} ]    "
-        f"rollout MSE {roll['mse'].mean():.2e}",
+        f"rollout MSE {pix:.2e}   spectral MSE {spec:.2e}{tag}",
         fontweight="bold", fontsize=11)
     fig.tight_layout()
     fig.savefig(out_png, dpi=140, bbox_inches="tight")
@@ -316,12 +337,21 @@ def main():
             "r": p.get("r"), "n0": p.get("n0"), "seed_type": p.get("seed_type"),
             "rollout_mse": float(roll["mse"].mean()),
             "final_mse": float(roll["mse"][-1]),
+            "spectral_mse": float(roll["spec_mse"].mean()),
             "mass_err": float(roll["mass_err"][-1]),
             "roll": roll,
         })
 
+    # Classify each trajectory's failure mode: a high pixel MSE that is NOT
+    # reflected in the phase-insensitive spectral MSE means the lattice is
+    # structurally correct but registration-shifted (benign for the physics).
+    for rec in records:
+        rec["phase_offset"] = (rec["rollout_mse"] > 5e-2
+                               and rec["spectral_mse"] < 0.3 * rec["rollout_mse"])
+
     rollout_mse_mean = float(np.mean([r["rollout_mse"] for r in records]))
     final_step_mse = float(np.mean([r["final_mse"] for r in records]))
+    spectral_mse_mean = float(np.mean([r["spectral_mse"] for r in records]))
     mass_err_final = float(np.mean([r["mass_err"] for r in records]))
 
     # 4) Visualizations -- show the WORST trajectories (most informative),
@@ -341,10 +371,12 @@ def main():
     with open(csv_path, "w", newline="") as f:
         w = csv.writer(f)
         w.writerow(["run", "r", "n0", "seed_type",
-                    "rollout_mse", "final_mse", "mass_err"])
+                    "rollout_mse", "final_mse", "spectral_mse",
+                    "phase_offset", "mass_err"])
         for rec in sorted(records, key=lambda r: r["run"]):
             w.writerow([rec["run"], rec["r"], rec["n0"], rec["seed_type"],
                         f"{rec['rollout_mse']:.6e}", f"{rec['final_mse']:.6e}",
+                        f"{rec['spectral_mse']:.6e}", int(rec["phase_offset"]),
                         f"{rec['mass_err']:.3e}"])
 
     def grouped(key):
@@ -360,7 +392,11 @@ def main():
     print(f"  1) One-step prediction MSE (normalized) : {os_mse:.4e}")
     print(f"  2) Rollout MSE  (mean over horizon)     : {rollout_mse_mean:.4e}")
     print(f"     Rollout MSE  (final step)            : {final_step_mse:.4e}")
-    print(f"  3) Relative mass error (final step)     : {mass_err_final:.4e}")
+    print(f"  3) Spectral MSE (phase-insensitive)     : {spectral_mse_mean:.4e}")
+    print(f"  4) Relative mass error (final step)     : {mass_err_final:.4e}")
+    n_offset = sum(r["phase_offset"] for r in records)
+    print(f"\n  Phase-offset trajectories (structurally correct, pixel-shifted):"
+          f" {n_offset}/{len(records)}")
     print("\n  Rollout MSE grouped by seed_type:")
     for k, (mean, n) in grouped("seed_type").items():
         print(f"      {k:<12s} {mean:.4e}   (n={n})")
@@ -369,8 +405,9 @@ def main():
         print(f"      r={k:<8s} {mean:.4e}   (n={n})")
     print("\n  Worst trajectories (visualized):")
     for rec in worst:
+        tag = " [phase-offset]" if rec["phase_offset"] else ""
         print(f"      traj_{rec['run']}  {_params_label(rec):<34s} "
-              f"MSE {rec['rollout_mse']:.3e}")
+              f"MSE {rec['rollout_mse']:.3e}  spec {rec['spectral_mse']:.3e}{tag}")
     print(f"\n  Figures + per_trajectory.csv written to: {out_dir}/")
     print("=" * 60)
 
