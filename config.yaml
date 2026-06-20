@@ -70,12 +70,17 @@ train:
                             # stable). false = full backprop-through-time.
   rollout_discount: 1.0     # per-step loss weight = discount**step (<=1)
   # --- physics-informed free-energy dissipation penalty (step 1) ---
-  physics_weight: 0.1       # weight on relu(relative free-energy increase). PFC
+  physics_weight: 0.02      # weight on relu(relative free-energy increase). PFC
                             # is a gradient flow, so F[n] must not rise; this
                             # penalizes unphysical energy-increasing predictions.
                             # 0 = pure-data baseline. The term is dimensionless
                             # and ~0 on clean data, so it never fights correct
                             # predictions -- only unphysical ones.
+                            # Retuned 0.1 -> 0.02: at 0.1 the penalty helped
+                            # multi-grain coarsening but hurt clean hex/point
+                            # lattices and stalled training early. 0.02 is the
+                            # gentle dose meant to keep the grain benefit without
+                            # the drag. See notebooks/03_physics_ablation.ipynb.
   num_workers: 0            # DataLoader workers (0 is safest on macOS/MPS)
   device: auto              # 'auto' | 'cuda' | 'mps' | 'cpu'
   seed: 0
