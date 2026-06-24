@@ -204,6 +204,114 @@ class FreeEnergyDissipation(nn.Module):
 
 
 # ----------------------------------------------------------------------------
+#  Differentiable PFC solver step + PDE-residual penalty (physics-informed,
+#  step 2). Step 1 enforced only ONE consequence of the physics (energy must
+#  not rise); step 2 enforces the WHOLE governing equation, using the solver
+#  itself as a teacher.
+# ----------------------------------------------------------------------------
+class DifferentiablePFCStep(nn.Module):
+    """
+    A torch re-implementation of the PFC solver's semi-implicit pseudo-spectral
+    update (see pfc_solver.PFCSolver.step), so the solver can run INSIDE the
+    training graph.
+
+    One saved frame of the dataset spans `substeps` solver steps of size `dt`
+    (the generator's save_every), so `frame()` applies the update that many
+    times -- reproducing exactly the integrator that produced the ground-truth
+    next frame. Because every op (fft2/ifft2, complex multiply, divide) is
+    differentiable, autograd flows through the whole chain; in the loss below we
+    nonetheless DETACH the output (use it as a fixed teacher) to avoid
+    backpropagating through `substeps` stiff semi-implicit steps.
+
+    The PFC operators depend on the per-sample temperature r, so the linear
+    eigenvalue L_op and the semi-implicit denominator are rebuilt per batch from
+    r. The |k|^2 grid and the 2/3 dealiasing mask depend only on the grid and
+    are cached per device/size (same lazy pattern as FreeEnergyDissipation).
+    """
+
+    def __init__(self, dx, dt, M, substeps):
+        super().__init__()
+        self.dx = float(dx)
+        self.dt = float(dt)
+        self.M = float(M)
+        self.substeps = int(substeps)
+        self._k2 = None
+        self._dealias = None
+
+    def _grids(self, H, W, device):
+        if (self._k2 is None or tuple(self._k2.shape) != (H, W)
+                or self._k2.device != device):
+            kx = torch.fft.fftfreq(H, d=self.dx, device=device) * 2 * math.pi
+            ky = torch.fft.fftfreq(W, d=self.dx, device=device) * 2 * math.pi
+            KX, KY = torch.meshgrid(kx, ky, indexing="ij")
+            self._k2 = KX ** 2 + KY ** 2
+            kmax = kx.abs().max() * 2.0 / 3.0          # 2/3-rule dealiasing cutoff
+            self._dealias = ((KX.abs() < kmax) & (KY.abs() < kmax)).to(self._k2.dtype)
+        return self._k2, self._dealias
+
+    def frame(self, n, r):
+        """
+        Advance a PHYSICAL field n: (B,1,H,W) by one saved-frame interval
+        (`substeps` semi-implicit steps). r: (B,) physical temperatures.
+        Mirrors PFCSolver.step exactly:  NL_hat = -M k^2 fft(n^3) (dealiased),
+        n_hat <- (n_hat + dt NL_hat)/(1 - dt L_op),  n <- ifft(n_hat).
+        """
+        B, _, H, W = n.shape
+        k2, dealias = self._grids(H, W, n.device)
+        rr = r.view(B, 1, 1, 1)
+        # Linear PFC eigenvalue  L = -M k^2 (k^4 - 2k^2 + 1 + r), diagonal in k.
+        L_op = -self.M * k2 * (k2 ** 2 - 2.0 * k2 + 1.0 + rr)        # (B,1,H,W)
+        denom = 1.0 / (1.0 - self.dt * L_op)                        # semi-implicit
+        n_hat = torch.fft.fft2(n)
+        for _ in range(self.substeps):
+            NL_hat = -(self.M * k2 * torch.fft.fft2(n ** 3)) * dealias
+            n_hat = (n_hat + self.dt * NL_hat) * denom
+            n = torch.fft.ifft2(n_hat).real
+        return n
+
+
+class PDEResidual(nn.Module):
+    """
+    Physics-informed consistency loss (step 2): the FULL PFC equation, enforced
+    through the differentiable solver rather than the free-energy inequality of
+    step 1.
+
+    For a predicted step we ask: if the solver advanced the model's INPUT frame
+    by one saved-frame interval, would it land on the model's PREDICTED frame?
+    It should -- that solver IS the data-generating process. The residual is the
+    relative squared mismatch
+
+        || n_pred - solver(n_in) ||^2  /  ( || solver(n_in) - n_in ||^2 + eps )
+
+    on the normalized field (same units as the data MSE). Dividing by the actual
+    frame-to-frame change makes it dimensionless and ~O(1), and ~0 wherever the
+    model predicts correctly -- so, like step 1, it only bites when a prediction
+    leaves the physical manifold.
+
+    The solver target is DETACHED: gradients flow only through n_pred, so we get
+    the teaching signal without backpropagating through `substeps` stiff steps.
+    The real payoff is during ROLLOUT, where n_in is an UNLABELED state the model
+    drifted into -- the solver supplies a physics target there that the dataset
+    cannot. Solver runs in physical units, so we denormalize in / renormalize out.
+    """
+
+    def __init__(self, stepper, norm_mean, norm_std):
+        super().__init__()
+        self.stepper = stepper
+        self.mean = float(norm_mean)
+        self.std = float(norm_std)
+
+    def forward(self, n_in_norm, n_pred_norm, r):
+        n_in = n_in_norm * self.std + self.mean                     # -> physical
+        with torch.no_grad():
+            target_phys = self.stepper.frame(n_in, r)               # detached teacher
+        target_norm = (target_phys - self.mean) / (self.std + 1e-8)
+        num = ((n_pred_norm - target_norm) ** 2).mean(dim=(-3, -2, -1))
+        den = ((target_norm - n_in_norm) ** 2).mean(dim=(-3, -2, -1)) + 1e-8
+        return (num / den).mean()
+
+
+# ----------------------------------------------------------------------------
 #  Gradient clipping that works with the FNO's complex spectral weights
 # ----------------------------------------------------------------------------
 def clip_grad_norm_(parameters, max_norm):
@@ -283,6 +391,7 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                 rollout_steps, include_cond, n_cond,
                 rollout_detach=True, rollout_discount=1.0,
                 fe_penalty=None, physics_weight=0.0,
+                pde_penalty=None, pde_weight=0.0,
                 writer=None, epoch=0, log_every=20):
     """
     One training epoch. Handles both regimes:
@@ -300,12 +409,20 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
 
     If `physics_weight > 0` and `fe_penalty` is given, a free-energy
     dissipation term (relu of the relative energy increase from the previous
-    frame) is added: total = data_loss + physics_weight * energy_penalty.
-    Returns (mean data loss, mean energy penalty).
+    frame) is added (step 1). If `pde_weight > 0` and `pde_penalty` is given, a
+    full PDE-residual term is added (step 2): the differentiable solver advances
+    the model's INPUT frame and the prediction is penalized for disagreeing with
+    it. During rollout this is evaluated at the model's own (unlabeled) states,
+    where the solver -- not the dataset -- supplies the physics target.
+
+        total = data_loss + physics_weight * energy_penalty + pde_weight * pde_residual
+
+    Returns (mean data loss, mean energy penalty, mean PDE residual).
     """
     model.train()
-    total, total_pen, n = 0.0, 0.0, 0
+    total, total_pen, total_pde, n = 0.0, 0.0, 0.0, 0
     use_fe = fe_penalty is not None and physics_weight > 0
+    use_pde = pde_penalty is not None and pde_weight > 0
     t0 = time.perf_counter()
     for it, batch in enumerate(loader):
         if rollout_steps > 1:
@@ -320,7 +437,7 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                     B, n_cond, H, W)
 
             cur, prev = density0, density0
-            data_loss, pen, wsum = 0.0, 0.0, 0.0
+            data_loss, pen, pde, wsum = 0.0, 0.0, 0.0, 0.0
             for j in range(targets.shape[1]):
                 inp = cur if cond_maps is None else torch.cat([cur, cond_maps], 1)
                 pred = model(inp)                               # (B,1,H,W)
@@ -328,11 +445,17 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                 data_loss = data_loss + w * loss_fn(pred, targets[:, j:j + 1], prev)
                 if use_fe:
                     pen = pen + w * fe_penalty(pred, prev, r)
+                if use_pde:
+                    # Residual against the solver applied to the model's ACTUAL
+                    # input `cur` (a true frame at j=0, an unlabeled rollout
+                    # state for j>0) -- not the true `prev`.
+                    pde = pde + w * pde_penalty(cur, pred, r)
                 wsum += w
                 prev = targets[:, j:j + 1]                      # true previous frame
                 cur = pred.detach() if rollout_detach else pred
             data_loss = data_loss / wsum
             pen = pen / wsum if use_fe else torch.zeros((), device=device)
+            pde = pde / wsum if use_pde else torch.zeros((), device=device)
             bs = B
         else:
             x, y, r = batch
@@ -343,9 +466,11 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
             data_loss = loss_fn(pred, y, x[:, :1])
             pen = fe_penalty(pred, x[:, :1], r) if use_fe \
                 else torch.zeros((), device=device)
+            pde = pde_penalty(x[:, :1], pred, r) if use_pde \
+                else torch.zeros((), device=device)
             bs = x.size(0)
 
-        loss = data_loss + physics_weight * pen
+        loss = data_loss + physics_weight * pen + pde_weight * pde
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
         if grad_clip and grad_clip > 0:
@@ -354,11 +479,13 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
 
         total += data_loss.item() * bs
         total_pen += float(pen.detach()) * bs
+        total_pde += float(pde.detach()) * bs
         n += bs
         if (it + 1) % log_every == 0:
             rate = (it + 1) / (time.perf_counter() - t0)
             eta = (len(loader) - it - 1) / max(rate, 1e-9)
             extra = f"  Epen {float(pen.detach()):.2e}" if use_fe else ""
+            extra += f"  PDE {float(pde.detach()):.2e}" if use_pde else ""
             print(f"\r    batch {it + 1:4d}/{len(loader)}  data {data_loss.item():.3e}"
                   f"{extra}  {rate:4.1f} batch/s  eta {eta:4.0f}s ", end="", flush=True)
             if writer is not None:
@@ -367,8 +494,11 @@ def train_epoch(model, loader, loss_fn, device, optimizer, grad_clip,
                 if use_fe:
                     writer.add_scalar("batch/train_energy_penalty", float(pen.detach()),
                                       epoch * len(loader) + it)
+                if use_pde:
+                    writer.add_scalar("batch/train_pde_residual", float(pde.detach()),
+                                      epoch * len(loader) + it)
     print("\r" + " " * 70 + "\r", end="", flush=True)
-    return total / max(n, 1), total_pen / max(n, 1)
+    return total / max(n, 1), total_pen / max(n, 1), total_pde / max(n, 1)
 
 
 # ----------------------------------------------------------------------------
@@ -514,11 +644,29 @@ def main():
         fe_penalty = FreeEnergyDissipation(
             info["norm_mean"], info["norm_std"], info["dx"]).to(device)
 
+    # Physics-informed full PDE-residual penalty (step 2): the differentiable
+    # PFC solver as a teacher. pde_weight = 0 leaves it off. The solver's dt / M
+    # / substeps come from the data's own metadata (so the stepper reproduces
+    # the integrator that generated the frames); config can override them.
+    pde_weight = float(cfg["train"].get("pde_weight", 0.0))
+    pde_penalty = None
+    if pde_weight > 0:
+        meta0 = inspect_trajectory(info["train_files"][0])["meta"]
+        pde_dt = float(cfg["train"].get("pde_dt", meta0.get("dt", 0.25)))
+        pde_M = float(cfg["train"].get("pde_M", meta0.get("M", 1.0)))
+        pde_substeps = int(cfg["train"].get("pde_substeps",
+                                            meta0.get("save_every", 25)))
+        stepper = DifferentiablePFCStep(info["dx"], pde_dt, pde_M, pde_substeps)
+        pde_penalty = PDEResidual(stepper, info["norm_mean"], info["norm_std"]).to(device)
+
     print(f"Loss: weight_mode={cfg['train'].get('loss_weight_mode', 'none')} "
           f"alpha={cfg['train'].get('loss_alpha', 5.0)}  |  "
           f"rollout_steps={rollout_steps} "
           f"(detach={cfg['train'].get('rollout_detach', True)})  |  "
           f"physics_weight={physics_weight} (free-energy dissipation, dx={info['dx']:.4f})")
+    if pde_weight > 0:
+        print(f"      pde_weight={pde_weight} (PDE residual via differentiable "
+              f"solver: dt={pde_dt} M={pde_M} substeps={pde_substeps})")
 
     # --- logging / checkpoints ---
     out_dir = cfg["logging"]["out_dir"]
@@ -561,7 +709,7 @@ def main():
     print("\nStarting training...\n")
     for epoch in range(es["epochs"]):
         t0 = time.time()
-        train_mse, train_pen = train_epoch(
+        train_mse, train_pen, train_pde = train_epoch(
             model, train_loader, loss_fn, device, optimizer,
             grad_clip=es.get("grad_clip", 0.0),
             rollout_steps=rollout_steps,
@@ -569,6 +717,7 @@ def main():
             rollout_detach=es.get("rollout_detach", True),
             rollout_discount=es.get("rollout_discount", 1.0),
             fe_penalty=fe_penalty, physics_weight=physics_weight,
+            pde_penalty=pde_penalty, pde_weight=pde_weight,
             writer=writer, epoch=epoch,
             log_every=cfg["logging"].get("log_every", 20))
         val_mse = run_epoch(model, val_loader, val_loss_fn, device)
@@ -583,6 +732,8 @@ def main():
             writer.add_scalar("epoch/lr", lr_now, epoch)
             if physics_weight > 0:
                 writer.add_scalar("epoch/train_energy_penalty", train_pen, epoch)
+            if pde_weight > 0:
+                writer.add_scalar("epoch/train_pde_residual", train_pde, epoch)
 
         # Periodic autoregressive rollout on val trajectories: the metric a
         # surrogate actually lives or dies by, watched during training.
@@ -610,6 +761,7 @@ def main():
 
         save_ckpt(last_path, epoch, val_mse)
         pen_note = f"  Epen {train_pen:.2e}" if physics_weight > 0 else ""
+        pen_note += f"  PDE {train_pde:.2e}" if pde_weight > 0 else ""
         print(f"epoch {epoch:3d}/{es['epochs']}  "
               f"train {train_mse:.3e}{pen_note}  val {val_mse:.3e}  "
               f"lr {lr_now:.2e}  {dt:.1f}s{roll_note}{flag}")

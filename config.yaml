@@ -81,6 +81,26 @@ train:
                             # lattices and stalled training early. 0.02 is the
                             # gentle dose meant to keep the grain benefit without
                             # the drag. See notebooks/03_physics_ablation.ipynb.
+  # --- physics-informed full PDE-residual penalty (step 2) ---
+  pde_weight: 0.0           # weight on the relative PDE residual enforced via a
+                            # DIFFERENTIABLE PFC solver (train_fno.DifferentiablePFCStep).
+                            # For each predicted step the solver advances the
+                            # model's INPUT frame one saved-frame interval and the
+                            # prediction is penalized for disagreeing -- the solver
+                            # acts as a teacher. Crucially this is evaluated at the
+                            # model's OWN rollout states (which have no label), so
+                            # it regularizes drift where the data loss is silent.
+                            # The term is relative (||err||^2 / ||frame change||^2),
+                            # so it is dimensionless and ~0 on correct steps. Solver
+                            # cost is TRAINING-ONLY -- inference is unchanged.
+                            # 0 = off. Start small (e.g. 0.05-0.1) and watch that
+                            # the PDE column falls without the data loss rising.
+                            # Next step (documented, not yet wired): gradient-norm
+                            # balancing to set this weight automatically instead of
+                            # by hand -- the adaptive fix for competing gradients.
+  # pde_substeps:          # solver steps per frame; default = data's save_every
+  # pde_dt:                # solver timestep; default = data's dt
+  # pde_M:                 # mobility; default = data's M
   num_workers: 0            # DataLoader workers (0 is safest on macOS/MPS)
   device: auto              # 'auto' | 'cuda' | 'mps' | 'cpu'
   seed: 0
