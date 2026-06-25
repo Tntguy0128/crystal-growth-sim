@@ -618,6 +618,16 @@ def main():
           f"enforce_mass={cfg['model'].get('enforce_mass', False)}  |  "
           f"{count_parameters(model):,} params")
 
+    # Optional warm-start: load weights from an existing checkpoint before
+    # training (fine-tuning). The architecture must match; norm stats and
+    # splits come from THIS run's config/data, not the checkpoint.
+    init_ckpt = cfg["train"].get("init_checkpoint")
+    if init_ckpt:
+        state = torch.load(init_ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(state["model_state"])
+        print(f"Warm-start: loaded weights from {init_ckpt} "
+              f"(epoch {state.get('epoch')}, val {state.get('val_loss')})")
+
     # --- optimizer / schedule / loss ---
     optimizer = torch.optim.Adam(
         model.parameters(),

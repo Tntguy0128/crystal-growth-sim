@@ -1,0 +1,8 @@
+# Crystal Studio tool
+streamlit>=1.30
+streamlit-drawable-canvas>=0.9.3
+numpy
+scipy
+matplotlib
+torch          # same version used to train the checkpoint
+pyyaml
