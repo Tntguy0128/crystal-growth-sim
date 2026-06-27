@@ -27,9 +27,30 @@ streamlit run crystal_tool/app.py
 ```
 
 In the sidebar, point "Checkpoint" at a trained **density-only** `best.pt`
-(e.g. from the grain-rich runs). Draw a seed, click **Grow crystal (FNO)**,
-read the measured characteristics, then **Check against target**. Use
-**Verify with real solver** for ground truth on the same seed.
+(e.g. from the grain-rich runs). Pick a **Seed source** (draw your own, or a
+preset), click **Grow crystal (FNO)**, read the measured characteristics, then
+**Check against target**. Use **Verify with real solver** for ground truth.
+
+### Local demo (one command)
+
+For a live demo on a laptop:
+
+1. Install deps: `pip install torch streamlit streamlit-drawable-canvas numpy scipy matplotlib pyyaml`
+2. Put the checkpoint in the **repo root**: `fno_grains_tuned.pt`
+   (download from Google Drive — the physics_weight=0.02 model).
+3. Launch:
+
+   ```bash
+   bash crystal_tool/run_local.sh
+   ```
+
+   Opens at http://localhost:8501. The "Seed source" radio gives a reliable
+   **preset** fallback (multi → polycrystal, point → single crystal) if drawing
+   live is awkward. Runs on CPU or Apple-MPS — fast at 128×128.
+
+> Note: the tuned model was trained on hex/point/multi seeds, so **presets and
+> simple drawn blobs predict best**; arbitrary freehand is the `custom_mask`
+> fine-tune (`notebooks/05_finetune_drawn.ipynb`).
 
 ## What works today vs. what's next
 

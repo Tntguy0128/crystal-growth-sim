@@ -20,6 +20,7 @@
 ============================================================
 """
 
+import os
 import time
 
 import numpy as np
@@ -66,11 +67,26 @@ def show_props(props, container):
 #  sidebar — model + physics controls
 # ----------------------------------------------------------------------------
 st.sidebar.header("Model & physics")
-ckpt = st.sidebar.text_input("Checkpoint (best.pt)", value="runs/fno_baseline/best.pt")
+ckpt = st.sidebar.text_input(
+    "Checkpoint (best.pt)", value="fno_demo.pt",
+    help="Path to a trained density-only checkpoint (repo root). "
+         "fno_demo.pt is the grain-trained model.")
 r = st.sidebar.slider("r  (quench depth)", -0.45, -0.20, -0.30, 0.01)
 n0 = st.sidebar.slider("n0 (mean density)", -0.35, -0.20, -0.285, 0.005)
 steps = st.sidebar.slider("rollout steps", 5, 60, 39, 1)
 seed_k0 = st.sidebar.number_input("seed wavenumber k0", value=1.0, step=0.1)
+
+st.sidebar.markdown("**Seed diversity**")
+orient_mode = st.sidebar.radio(
+    "Lattice orientation", ["Random each grow", "Fixed angle"],
+    help="The crystal angle is what makes each drawing look different. "
+         "Random gives a fresh orientation every time you grow.")
+fixed_angle = st.sidebar.slider("Fixed angle (deg)", 0, 60, 0,
+                                disabled=(orient_mode != "Fixed angle"))
+per_region = st.sidebar.checkbox(
+    "Per-region orientations (polycrystal seed)", value=False,
+    help="Each separate blob/stroke gets its own orientation, so multi-part "
+         "drawings seed grain boundaries.")
 
 st.title("Crystal Studio")
 st.caption("Draw a seed → predict the crystal → measure it → check it against your target.")
@@ -81,7 +97,11 @@ col_draw, col_out = st.columns([1, 1])
 #  left — draw the seed
 # ----------------------------------------------------------------------------
 with col_draw:
-    st.subheader("1 · Draw your seed")
+    st.subheader("1 · Choose a seed")
+    seed_source = st.radio(
+        "Seed source",
+        ["Draw", "Preset · multi (polycrystal)", "Preset · point (single)"],
+        help="Draw your own, or use a built-in seed as a reliable fallback.")
     st.caption("White = where crystal nucleates. Draw blobs, lines, patterns.")
     canvas = st_canvas(
         fill_color="#FFFFFF", stroke_width=14, stroke_color="#FFFFFF",
@@ -95,11 +115,24 @@ with col_draw:
 #  growth + analysis
 # ----------------------------------------------------------------------------
 def run_growth(use_solver):
-    if canvas.image_data is None or canvas.image_data[..., :3].sum() == 0:
-        st.warning("Draw a seed first.")
+    if not use_solver and not os.path.exists(ckpt):
+        st.error(f"Checkpoint not found: `{ckpt}`. Download "
+                 "**fno_grains_tuned.pt** from Drive into the repo root "
+                 "(or fix the sidebar path).")
         return
-    field0, cfg = G.mask_to_field(canvas.image_data, r=r, n0=n0, N=N,
-                                  seed_k0=seed_k0)
+    # Build the initial field from the chosen seed source.
+    if seed_source == "Draw":
+        if canvas.image_data is None or canvas.image_data[..., :3].sum() == 0:
+            st.warning("Draw a seed first, or pick a preset.")
+            return
+        orientation = fixed_angle if orient_mode == "Fixed angle" else "random"
+        field0, cfg = G.mask_to_field(canvas.image_data, r=r, n0=n0, N=N,
+                                      seed_k0=seed_k0, orientation=orientation,
+                                      per_region=per_region)
+    elif "multi" in seed_source:
+        field0, cfg = G.preset_field("multi", r=r, n0=n0, N=N, seed_k0=seed_k0)
+    else:
+        field0, cfg = G.preset_field("point", r=r, n0=n0, N=N, seed_k0=seed_k0)
     with col_out:
         st.subheader("2 · Crystal growth")
         ph = st.empty()
@@ -108,7 +141,7 @@ def run_growth(use_solver):
             tag = "solver (ground truth)"
         else:
             model, ck, device = get_model(ckpt)
-            frames = G.grow_fno(model, ck, device, field0, steps=steps)
+            frames = G.grow_fno(model, ck, device, field0, steps=steps, cfg=cfg)
             tag = "FNO prediction"
         for f in frames:
             ph.pyplot(render(f, title=tag))

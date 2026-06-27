@@ -81,7 +81,10 @@ def crystallinity(field, R0=None, band=2):
     total = P.copy()
     total[r < 2] = 0.0                    # exclude DC core
     denom = total.sum()
-    return float(P[ring].sum() / denom) if denom > 0 else 0.0
+    # Homogeneous / liquid: almost all power sits in DC -> no lattice order.
+    if denom < 1e-4 * P.sum():
+        return 0.0
+    return float(min(P[ring].sum() / denom, 1.0)) if denom > 0 else 0.0
 
 
 def _ring_angles(field, R0, band=2, nbins=180):
@@ -115,6 +118,40 @@ def dominant_orientation(field, R0):
     z = np.sum(w * np.exp(1j * np.deg2rad(ang * 6.0)))   # 6-fold folding
     spread = float(1.0 - np.abs(z))                       # 0 sharp .. 1 smeared
     return theta, spread
+
+
+# ----------------------------------------------------------------------------
+#  Phase classification (hexagonal / stripe / liquid) from the diffraction ring
+# ----------------------------------------------------------------------------
+def _angular_peaks(hist, rel=0.4, min_sep_deg=22):
+    """Count distinct angular peaks on the dominant ring (folded mod 180°)."""
+    nbins = len(hist)
+    h = hist / (hist.max() + 1e-12)
+    sep = int(min_sep_deg / 180.0 * nbins)
+    peaks = []
+    for i in np.argsort(h)[::-1]:
+        if h[i] < rel:
+            break
+        if all(min((i - p) % nbins, (p - i) % nbins) > sep for p in peaks):
+            peaks.append(i)
+    return len(peaks)
+
+
+def classify_phase(field, dx, cryst_thresh=0.30):
+    """
+    Identify the crystal PHASE from the diffraction pattern:
+      * "liquid"     — no sharp ring (disordered / homogeneous)
+      * "stripe"     — one dominant axis (lamellar rolls): a single angular peak
+                       (two Bragg spots 180° apart, folded to one)
+      * "hexagonal"  — three axes 60° apart: ~3 angular peaks (six Bragg spots)
+    A real materials-physics measurement: the same field that looks like "spots"
+    or "stripes" to the eye is classified from its spectral symmetry.
+    """
+    _, R0 = lattice_wavelength(field, dx)
+    if crystallinity(field, R0) < cryst_thresh:
+        return "liquid"
+    npk = _angular_peaks(_ring_angles(field, R0))
+    return "stripe" if npk <= 1 else "hexagonal"
 
 
 # ----------------------------------------------------------------------------
@@ -262,6 +299,7 @@ def analyze(field, dx, rel_thresh=0.2):
     defect_density = (len(defects) / n_int) if n_int > 0 else 0.0
 
     return {
+        "phase": classify_phase(field, dx),
         "lattice_wavelength": float(lam),
         "crystallinity": float(cryst),
         "dominant_orientation_deg": float(theta),
@@ -284,6 +322,7 @@ def summary_lines(props):
             else "single crystal" if props["n_grains"] <= 1
             else f"polycrystal ({props['n_grains']} grains)")
     return [
+        f"Phase             : {props.get('phase', '—')}",
         f"Structure         : {kind}",
         f"Crystallinity     : {props['crystallinity']:.2f}  (0 liquid → 1 perfect)",
         f"Grains            : {poly}",

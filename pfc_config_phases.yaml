@@ -1,0 +1,66 @@
+# ============================================================
+#  Phase-spanning PFC dataset  (for a PARAMETRIC surrogate)
+#  3 r x 6 n0 x random-noise x 3 ensembles = 54 runs
+#  Use:  python generate_dataset.py --sweep --config pfc_config_phases.yaml
+# ============================================================
+# Goal: train a PARAMETRIC FNO (include_conditioning: true) that maps
+# (density, r, n0) -> next density, so a single model spans the whole PFC
+# phase diagram -- stripe / hexagonal / liquid -- instead of one frozen regime.
+#
+# Why random_noise seeds: with a NEUTRAL initial condition the equilibrium
+# phase emerges from the physics (set by r, n0), not from a planted lattice.
+# That is exactly the parameter -> phase map we want the surrogate to learn
+# (verified with crystal_tool/phase_diagram.py: stripe near n0~0, hex at
+# intermediate density, liquid at the extremes).
+#
+# dt_frame = save_every * dt = 6.25 is UNCHANGED, so the one-step map the FNO
+# learns is the same timescale as every other dataset in this project.
+
+run:
+  # physics
+  r: -0.30
+  n0: -0.20
+  M: 1.0
+
+  # grid
+  N: 128
+  L: 50.26548245743669      # 16 * pi
+
+  # time (dt_frame = 6.25 -- do not change)
+  dt: 0.25
+  T: 250.0
+  save_every: 25            # -> 40 frames per trajectory
+
+  # initial condition: neutral liquid + noise, so the phase self-selects
+  seed_type: random_noise
+  rng_seed: 42
+  noise_amplitude: 0.10     # enough to nucleate spontaneous ordering
+  seed_amplitude: 0.20
+  seed_k0: 1.0
+
+  # output
+  output_dir: data_pfc_phases
+  save_plots: false
+  save_animation: false
+
+  # sanity checks (random-noise runs at extreme n0 may stay liquid -> looser)
+  mass_drift_tol: 1.0e-5
+  energy_increase_tol: 5.0e-3
+
+# ----- Sweep across the phase diagram (r x n0), neutral seeds
+sweep:
+  r_values: [-0.20, -0.30, -0.40]
+  n0_values: [0.0, -0.10, -0.18, -0.25, -0.32, -0.40]   # stripe -> hex -> liquid
+  seed_types: [random_noise]
+  n_ensemble: 3                                          # -> 3*6*1*3 = 54 runs
+  base_rng_seed: 7000
+  skip_existing: false
+  parallel: true
+  max_workers: 4
+
+# NOTE for PARAMETRIC FNO training (config.yaml):
+#   data:
+#     data_dir: data_pfc_phases
+#     split_by: config
+#     include_conditioning: true        # append r, n0 as input channels
+#     normalize_conditioning: true
